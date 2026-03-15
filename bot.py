@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
+import google.generativeai as genai
 from flask import Flask, request, session, jsonify, render_template_string
 import threading
 import sqlite3
@@ -12,10 +13,6 @@ import datetime
 import json
 import secrets
 from typing import List, Dict, Any, Optional
-
-# NEW GOOGLE SDK IMPORTS
-from google import genai
-from google.genai import types
 
 # -------------------- Configuration & Globals --------------------
 START_TIME = time.time()
@@ -34,19 +31,34 @@ FLASK_SECRET = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
 # Render provides PORT env var
 PORT = int(os.environ.get("PORT", 5000))
 
+# -------------------- Token Retrieval (handle multiple possible env var names) --------------------
+def get_discord_token() -> str:
+    """Retrieve Discord token from environment variables, checking common names."""
+    token = os.environ.get("DISCORD_BOT_TOKEN") or os.environ.get("DISCORD_TOKEN")
+    if not token:
+        raise ValueError(
+            "Discord token not found. Please set DISCORD_BOT_TOKEN or DISCORD_TOKEN environment variable."
+        )
+    return token
+
 # -------------------- Database Setup --------------------
 def init_db():
     """Create all necessary tables if they don't exist."""
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
+        # Global configuration (key-value)
         c.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        # User personality presets
         c.execute("CREATE TABLE IF NOT EXISTS user_personality (user_id INTEGER PRIMARY KEY, preset TEXT)")
+        # Allowed channels per guild for auto-reply
         c.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
+        # Message history per channel (for context compression)
         c.execute("""CREATE TABLE IF NOT EXISTS message_history (
             channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
             content TEXT, timestamp INTEGER
         )""")
+        # Insert default system prompt if not present
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('system_prompt', 'You are YoAI, a helpful AI assistant.')")
         conn.commit()
         conn.close()
@@ -62,38 +74,37 @@ class GeminiKeyManager:
         return len(self.keys)
     
     def generate_with_fallback(self, model_name: str, contents: Any, system_instruction: Optional[str] = None, max_retries: Optional[int] = None) -> str:
+        """
+        Attempt to generate content using random keys, falling back through all available keys.
+        By default, tries all keys sequentially until one succeeds.
+        Returns the generated text or raises exception if all keys fail.
+        """
         if max_retries is None:
-            max_retries = len(self.keys) 
+            max_retries = len(self.keys)  # Try all keys
         
+        # Shuffle keys to randomize order
         shuffled_keys = random.sample(self.keys, len(self.keys))
         last_error = None
         
         for attempt, key in enumerate(shuffled_keys[:max_retries]):
             try:
-                # UPDATED TO NEW SDK SYNTAX
-                client = genai.Client(api_key=key)
-                
-                config = None
-                if system_instruction:
-                    config = types.GenerateContentConfig(system_instruction=system_instruction)
-                
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config
-                )
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+                response = model.generate_content(contents)
                 return response.text
             except Exception as e:
                 last_error = e
                 print(f"Key {key[:8]}... failed (attempt {attempt+1}/{max_retries}): {e}")
                 continue
         
+        # If we exhausted all retries, raise the last error
         raise last_error or Exception("All Gemini keys failed")
 
 key_manager = GeminiKeyManager(GEMINI_KEYS)
 
 # -------------------- Helper Functions --------------------
 def get_system_prompt() -> str:
+    """Retrieve the global system prompt from database."""
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -103,6 +114,7 @@ def get_system_prompt() -> str:
         return result[0] if result else "You are YoAI, a helpful AI assistant."
 
 def set_system_prompt(prompt: str):
+    """Update the global system prompt."""
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -111,6 +123,7 @@ def set_system_prompt(prompt: str):
         conn.close()
 
 def get_user_personality(user_id: int) -> str:
+    """Get personality preset for a user (default: 'default')."""
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -120,6 +133,7 @@ def get_user_personality(user_id: int) -> str:
         return result[0] if result else "default"
 
 def set_user_personality(user_id: int, preset: str):
+    """Set personality preset for a user."""
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -128,7 +142,8 @@ def set_user_personality(user_id: int, preset: str):
         conn.close()
 
 def is_channel_allowed(guild_id: Optional[int], channel_id: int) -> bool:
-    if guild_id is None:  
+    """Check if a channel is in the allowed list for its guild (None for DM)."""
+    if guild_id is None:  # DM channels are always allowed
         return True
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -155,33 +170,42 @@ def remove_allowed_channel(guild_id: int, channel_id: int):
         conn.close()
 
 def add_message_to_history(channel_id: int, message_id: int, author_id: int, content: str, timestamp: int):
+    """Insert a message into history, then if count > 20, compress oldest ones."""
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
+        # Insert new message
         c.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
                   (channel_id, message_id, author_id, content, timestamp))
+        # Count messages for this channel
         c.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,))
         count = c.fetchone()[0]
         if count > 20:
+            # Fetch oldest 10 messages (sorted by timestamp, then message_id to break ties)
             c.execute("""SELECT message_id, author_id, content, timestamp FROM message_history 
                          WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10""", (channel_id,))
             oldest = c.fetchall()
             if oldest:
+                # Build a text block to summarize
                 texts = []
                 for mid, aid, cnt, ts in oldest:
+                    # Skip if it's already a summary (author_id=0)
                     if aid != 0:
                         texts.append(f"User {aid}: {cnt}")
                 if texts:
                     summary_text = summarize_with_gemini("\n".join(texts))
+                    # Delete the oldest 10 messages
                     oldest_ids = [mid for mid, _, _, _ in oldest]
                     c.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
+                    # Insert summary message with author_id=0 (system) and timestamp = oldest[0][3] (first message's timestamp)
                     summary_timestamp = oldest[0][3]
                     c.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)",
-                              (channel_id, -1, summary_text, summary_timestamp)) 
+                              (channel_id, -1, summary_text, summary_timestamp))  # Use negative dummy message_id to avoid collisions
         conn.commit()
         conn.close()
 
 def get_channel_history(channel_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    """Retrieve last N messages for a channel (ordered by timestamp)."""
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -192,22 +216,27 @@ def get_channel_history(channel_id: int, limit: int = 20) -> List[Dict[str, Any]
         return [{"author_id": row[0], "content": row[1], "timestamp": row[2]} for row in rows]
 
 def summarize_with_gemini(text: str) -> str:
+    """Use Gemini to summarize a block of text with fallback across all keys."""
     try:
+        # Use all keys for fallback (max_retries = total keys)
         return key_manager.generate_with_fallback(
             model_name='gemini-1.5-flash',
             contents=f"Summarize the following conversation concisely, preserving key points:\n{text}",
-            max_retries=key_manager.count()  
+            max_retries=key_manager.count()  # Try all keys
         )
     except Exception as e:
         print(f"Summarization error after fallback: {e}")
         return "[Summary unavailable]"
 
 async def generate_ai_response(channel_id: int, user_message: str, author_id: int) -> str:
+    """Generate a response using Gemini with context and personality, with key fallback."""
     global TOTAL_QUERIES
     TOTAL_QUERIES += 1
 
+    # Get channel history
     history = get_channel_history(channel_id, limit=20)
     
+    # Build conversation context
     context = ""
     for msg in history:
         if msg["author_id"] == 0:
@@ -216,6 +245,7 @@ async def generate_ai_response(channel_id: int, user_message: str, author_id: in
             context += f"User {msg['author_id']}: {msg['content']}\n"
     context += f"User {author_id}: {user_message}\nYoAI:"
 
+    # Get system prompt and personality
     system = get_system_prompt()
     personality = get_user_personality(author_id)
     if personality == "hacker":
@@ -224,11 +254,12 @@ async def generate_ai_response(channel_id: int, user_message: str, author_id: in
         system += " Respond like a tsundere anime character, with a mix of harshness and hidden kindness."
 
     try:
+        # Use all keys for fallback (max_retries = total keys)
         response_text = key_manager.generate_with_fallback(
             model_name='gemini-1.5-flash',
             contents=context,
             system_instruction=system,
-            max_retries=key_manager.count()  
+            max_retries=key_manager.count()  # Try all keys
         )
         return response_text
     except Exception as e:
@@ -243,10 +274,7 @@ intents.guilds = True
 class YoAIBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        print(f"Synced commands for {self.user}")
+        # No manual tree assignment; base class provides bot.tree
 
 bot = YoAIBot()
 
@@ -328,9 +356,11 @@ async def setchannel(interaction: discord.Interaction, enabled: bool):
 # -------------------- Message Handling (Auto-reply) --------------------
 @bot.event
 async def on_message(message: discord.Message):
+    # Ignore bot's own messages
     if message.author == bot.user:
         return
 
+    # Store every message in history for context
     add_message_to_history(
         channel_id=message.channel.id,
         message_id=message.id,
@@ -339,24 +369,28 @@ async def on_message(message: discord.Message):
         timestamp=int(message.created_at.timestamp())
     )
 
+    # Determine if we should reply
     should_reply = False
-    if message.guild is None:
+    if message.guild is None:  # DM
         should_reply = True
     else:
         if is_channel_allowed(message.guild.id, message.channel.id):
             should_reply = True
+        # Optionally also reply if mentioned (can be added, but not required by spec)
 
     if should_reply:
         async with message.channel.typing():
             response = await generate_ai_response(message.channel.id, message.content, message.author.id)
             await message.reply(response)
 
+    # Allow commands to be processed (if any)
     await bot.process_commands(message)
 
 # -------------------- Flask Web Dashboard --------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
+# HTML template (single page with login + dashboard)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -489,6 +523,7 @@ HTML_TEMPLATE = """
                 document.getElementById('memory').innerText = data.active_memory_rows;
             } catch (e) {
                 console.error(e);
+                // If unauthorized, show login again
                 document.getElementById('login-view').style.display = 'block';
                 document.getElementById('dashboard-view').style.display = 'none';
             }
@@ -500,6 +535,7 @@ HTML_TEMPLATE = """
             document.getElementById('dashboard-view').style.display = 'none';
         }
 
+        // Check if already logged in on page load
         window.onload = async () => {
             const res = await fetch('/api/stats', { credentials: 'same-origin' });
             if (res.ok) {
@@ -554,8 +590,8 @@ def run_flask():
 
 # -------------------- Main --------------------
 if __name__ == "__main__":
+    # Start Flask in a background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    
-    # FIXED: Correct Render Variable
-    bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
+    # Run Discord bot (blocking) with token from helper function
+    bot.run(get_discord_token())
