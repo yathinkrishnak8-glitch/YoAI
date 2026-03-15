@@ -386,114 +386,334 @@ async def on_message(message: discord.Message):
     # Allow commands to be processed (if any)
     await bot.process_commands(message)
 
-# -------------------- Flask Web Dashboard --------------------
+# -------------------- Flask Web Dashboard (Modern Anime-Themed) --------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
-# HTML template (single page with login + dashboard)
+# HTML template with anime aesthetic, liquid glass, particles, and motion VFX
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YoAI Dashboard</title>
+    <title>YoAI · Anime Dashboard</title>
+    <!-- Fonts & Icons -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         body {
-            background: linear-gradient(135deg, #1e1e2f 0%, #2a2a40 100%);
+            font-family: 'Inter', sans-serif;
             min-height: 100vh;
+            background: radial-gradient(circle at 20% 30%, #1a0b2e, #0d071a);
+            overflow: hidden;
+            position: relative;
+            color: #fff;
+        }
+        /* Animated particle canvas */
+        #particle-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            pointer-events: none;
+        }
+        /* Main glass container */
+        .glass-container {
+            position: relative;
+            z-index: 10;
             display: flex;
             justify-content: center;
             align-items: center;
-            color: #fff;
+            min-height: 100vh;
+            padding: 1.5rem;
         }
         .glass-panel {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 30px;
-            width: 90%;
-            max-width: 600px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(20, 10, 35, 0.3);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 3rem;
+            padding: 2.5rem 2rem;
+            width: 100%;
+            max-width: 700px;
+            box-shadow: 0 25px 50px -8px rgba(0, 0, 0, 0.6), 0 0 0 2px rgba(255, 120, 240, 0.2) inset, 0 0 20px #ff6ec7;
+            border: 1px solid rgba(255, 180, 255, 0.3);
+            transition: transform 0.3s ease, box-shadow 0.4s ease;
+            animation: float 6s infinite alternate ease-in-out;
         }
-        h1 { text-align: center; margin-bottom: 20px; font-weight: 300; letter-spacing: 2px; }
-        .login-form { display: flex; flex-direction: column; gap: 15px; }
+        .glass-panel:hover {
+            transform: scale(1.01) translateY(-5px);
+            box-shadow: 0 30px 60px -8px #ff6ec780, 0 0 0 3px rgba(255, 120, 240, 0.5) inset, 0 0 40px #ffb3ff;
+        }
+        @keyframes float {
+            0% { transform: translateY(0px); }
+            100% { transform: translateY(-12px); }
+        }
+        /* Anime character decoration */
+        .anime-decor {
+            position: absolute;
+            top: -30px;
+            right: -20px;
+            width: 150px;
+            height: 150px;
+            background: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="45" r="25" fill="%23ffb3ff" opacity="0.3"/><circle cx="40" cy="40" r="5" fill="white"/><circle cx="60" cy="40" r="5" fill="white"/><path d="M40 60 Q50 70, 60 60" stroke="white" stroke-width="3" fill="none"/></svg>') no-repeat center;
+            background-size: contain;
+            opacity: 0.5;
+            animation: bounce 4s infinite;
+        }
+        @keyframes bounce {
+            0%,100%{ transform: translateY(0) rotate(0deg); }
+            50%{ transform: translateY(-15px) rotate(5deg); }
+        }
+        /* Header */
+        h1 {
+            font-size: 3.2rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff, #ffb3ff, #a5d8ff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 0.5rem;
+            letter-spacing: -0.02em;
+            filter: drop-shadow(0 0 15px #ff9eff);
+        }
+        .subtitle {
+            font-size: 1rem;
+            color: #d9b3ff;
+            margin-bottom: 2rem;
+            border-left: 4px solid #ff99ff;
+            padding-left: 1rem;
+            font-style: italic;
+        }
+        /* Login form */
+        .login-form {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+        .input-group {
+            position: relative;
+        }
+        .input-group i {
+            position: absolute;
+            left: 20px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #ffb3ff;
+            font-size: 1.3rem;
+        }
         input[type="password"] {
-            padding: 15px;
+            width: 100%;
+            padding: 1.2rem 1.2rem 1.2rem 3.5rem;
             border: none;
-            border-radius: 10px;
-            background: rgba(255,255,255,0.2);
+            border-radius: 60px;
+            background: rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(8px);
             color: white;
-            font-size: 16px;
+            font-size: 1.2rem;
+            border: 1px solid rgba(255, 200, 255, 0.3);
+            transition: all 0.3s;
         }
-        input[type="password"]::placeholder { color: rgba(255,255,255,0.6); }
+        input[type="password"]:focus {
+            outline: none;
+            border-color: #ffaaff;
+            box-shadow: 0 0 25px #ffaaff;
+            background: rgba(255, 255, 255, 0.15);
+        }
+        input[type="password"]::placeholder {
+            color: rgba(255, 200, 255, 0.7);
+            font-weight: 300;
+        }
         button {
-            padding: 15px;
+            padding: 1.2rem;
             border: none;
-            border-radius: 10px;
-            background: #6c5ce7;
+            border-radius: 60px;
+            background: linear-gradient(45deg, #b86eff, #ff7ce7);
             color: white;
-            font-size: 16px;
+            font-size: 1.3rem;
+            font-weight: 600;
             cursor: pointer;
-            transition: background 0.3s;
+            transition: all 0.3s;
+            box-shadow: 0 8px 20px #b86eff80;
+            border: 1px solid rgba(255,255,255,0.3);
+            letter-spacing: 1px;
         }
-        button:hover { background: #5b4bc4; }
+        button:hover {
+            transform: scale(1.02);
+            box-shadow: 0 15px 30px #ff7ce7;
+            background: linear-gradient(45deg, #c47cff, #ff95f0);
+        }
+        /* Dashboard stats */
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 20px;
-            margin-top: 30px;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 1.5rem;
+            margin: 2.5rem 0;
         }
         .stat-card {
-            background: rgba(0,0,0,0.3);
-            border-radius: 15px;
-            padding: 20px;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(4px);
+            border-radius: 2rem;
+            padding: 1.5rem 1rem;
             text-align: center;
-            backdrop-filter: blur(5px);
+            border: 1px solid rgba(255, 180, 255, 0.2);
+            transition: 0.3s;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.4);
         }
-        .stat-value { font-size: 2em; font-weight: bold; color: #a8e6cf; }
-        .stat-label { font-size: 0.9em; opacity: 0.8; margin-top: 5px; }
+        .stat-card:hover {
+            background: rgba(255, 200, 255, 0.1);
+            border-color: #ffaaff;
+            transform: translateY(-6px) scale(1.02);
+            box-shadow: 0 20px 30px #ff6ec780;
+        }
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff, #ffd6ff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            line-height: 1.2;
+        }
+        .stat-label {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: #ccaaff;
+            margin-top: 0.5rem;
+        }
         .logout-btn {
-            margin-top: 20px;
-            background: #d63031;
+            background: transparent;
+            border: 2px solid #ff7ce7;
+            color: #ffb3ff;
+            box-shadow: none;
+            margin-top: 1rem;
         }
-        .logout-btn:hover { background: #c0392b; }
+        .logout-btn:hover {
+            background: #ff7ce7;
+            color: #1a0b2e;
+            border-color: #ff7ce7;
+        }
+        /* Mobile adaptation */
         @media (max-width: 600px) {
-            .glass-panel { padding: 20px; }
-            .stats-grid { grid-template-columns: 1fr; }
+            .glass-panel { padding: 2rem 1.5rem; border-radius: 2rem; }
+            h1 { font-size: 2.5rem; }
+            .stat-value { font-size: 2rem; }
+            .anime-decor { width: 100px; height: 100px; top: -20px; right: -10px; }
+        }
+        /* small extra animation on cards */
+        .stat-card i {
+            font-size: 2rem;
+            color: #ffb3ff;
+            margin-bottom: 0.5rem;
+            display: block;
         }
     </style>
 </head>
 <body>
-    <div class="glass-panel" id="app">
-        <h1>🔐 YoAI System</h1>
-        <div id="login-view">
-            <form class="login-form" onsubmit="login(event)">
-                <input type="password" id="password" placeholder="Enter password" required>
-                <button type="submit">Login</button>
-            </form>
-        </div>
-        <div id="dashboard-view" style="display: none;">
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-value" id="uptime">-</div>
-                    <div class="stat-label">Uptime</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="queries">-</div>
-                    <div class="stat-label">Total Queries</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="memory">-</div>
-                    <div class="stat-label">Memory Rows</div>
-                </div>
+    <canvas id="particle-canvas"></canvas>
+    <div class="glass-container">
+        <div class="glass-panel">
+            <div class="anime-decor"></div>
+            <h1>✨ YoAI ✨</h1>
+            <div class="subtitle">where intelligence meets aesthetics</div>
+
+            <!-- LOGIN VIEW -->
+            <div id="login-view">
+                <form class="login-form" onsubmit="login(event)">
+                    <div class="input-group">
+                        <i class="fas fa-lock"></i>
+                        <input type="password" id="password" placeholder="secret phrase" required>
+                    </div>
+                    <button type="submit"><i class="fas fa-sign-in-alt" style="margin-right: 8px;"></i> Enter the system</button>
+                </form>
             </div>
-            <button class="logout-btn" onclick="logout()">Logout</button>
+
+            <!-- DASHBOARD VIEW (hidden by default) -->
+            <div id="dashboard-view" style="display: none;">
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <i class="fas fa-clock"></i>
+                        <div class="stat-value" id="uptime">-</div>
+                        <div class="stat-label">Uptime</div>
+                    </div>
+                    <div class="stat-card">
+                        <i class="fas fa-database"></i>
+                        <div class="stat-value" id="queries">-</div>
+                        <div class="stat-label">Queries</div>
+                    </div>
+                    <div class="stat-card">
+                        <i class="fas fa-memory"></i>
+                        <div class="stat-value" id="memory">-</div>
+                        <div class="stat-label">Memory rows</div>
+                    </div>
+                </div>
+                <button class="logout-btn" onclick="logout()"><i class="fas fa-door-open"></i> Logout</button>
+            </div>
         </div>
     </div>
+
     <script>
+        // Particle animation (floating sakura-like particles)
+        const canvas = document.getElementById('particle-canvas');
+        const ctx = canvas.getContext('2d');
+        let width, height;
+        let particles = [];
+
+        function initParticles() {
+            particles = [];
+            const count = 70;
+            for (let i = 0; i < count; i++) {
+                particles.push({
+                    x: Math.random() * width,
+                    y: Math.random() * height,
+                    size: Math.random() * 6 + 2,
+                    speedX: (Math.random() - 0.5) * 0.2,
+                    speedY: Math.random() * 0.5 + 0.2,
+                    color: `rgba(255, ${Math.floor(150 + Math.random() * 80)}, 255, ${Math.random() * 0.4 + 0.2})`
+                });
+            }
+        }
+
+        function resizeCanvas() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+            initParticles();
+        }
+
+        function drawParticles() {
+            ctx.clearRect(0, 0, width, height);
+            for (let p of particles) {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                ctx.fillStyle = p.color;
+                ctx.fill();
+                // move
+                p.x += p.speedX;
+                p.y += p.speedY;
+                // wrap around
+                if (p.x > width) p.x = 0;
+                if (p.x < 0) p.x = width;
+                if (p.y > height) p.y = 0;
+            }
+            requestAnimationFrame(drawParticles);
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        drawParticles();
+
+        // ---------- Login / Dashboard logic ----------
         async function login(event) {
             event.preventDefault();
             const pwd = document.getElementById('password').value;
@@ -509,7 +729,7 @@ HTML_TEMPLATE = """
                 fetchStats();
                 setInterval(fetchStats, 3000);
             } else {
-                alert('Invalid password');
+                alert('🔮 Incorrect password, try again.');
             }
         }
 
@@ -523,7 +743,6 @@ HTML_TEMPLATE = """
                 document.getElementById('memory').innerText = data.active_memory_rows;
             } catch (e) {
                 console.error(e);
-                // If unauthorized, show login again
                 document.getElementById('login-view').style.display = 'block';
                 document.getElementById('dashboard-view').style.display = 'none';
             }
@@ -535,7 +754,6 @@ HTML_TEMPLATE = """
             document.getElementById('dashboard-view').style.display = 'none';
         }
 
-        // Check if already logged in on page load
         window.onload = async () => {
             const res = await fetch('/api/stats', { credentials: 'same-origin' });
             if (res.ok) {
