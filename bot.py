@@ -72,7 +72,8 @@ class GeminiKeyManager:
                 return response.text
             except Exception as e:
                 last_error = e
-                print(f"Key {key[:8]}... failed: {e}")
+                # Flush=True forces Render to instantly show the error in the logs
+                print(f"Key {key[:8]}... failed: {e}", flush=True)
                 continue
         
         raise last_error or Exception("All 10 Gemini keys failed.")
@@ -150,7 +151,6 @@ def add_message_to_history(channel_id: int, message_id: int, author_id: int, con
         c.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,))
         count = c.fetchone()[0]
         
-        # Context Compression
         if count > 20:
             c.execute("""SELECT message_id, author_id, content, timestamp FROM message_history 
                          WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10""", (channel_id,))
@@ -195,8 +195,9 @@ async def generate_ai_response(channel_id: int, user_message: str, author_id: in
     try:
         return key_manager.generate_with_fallback('gemini-1.5-flash', context, system)
     except Exception as e:
-        print(f"AI error: {e}")
-        return "System failure. Could not connect to the AI mainframe."
+        print(f"AI error: {e}", flush=True)
+        # ⚠️ DIAGNOSTIC OVERRIDE: The bot will now literally tell you exactly why Google rejected it
+        return f"⚠️ **Google API Connection Failed.**\nExact Error: `{str(e)}`\n*(Please read this error to fix the API keys!)*"
 
 # -------------------- Discord Bot --------------------
 intents = discord.Intents.default()
@@ -277,47 +278,36 @@ async def unsetchannel(interaction: discord.Interaction):
 # -------------------- DM & Server Message Routing --------------------
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore the bot's own messages
     if message.author == bot.user:
         return
 
-    # 1. Determine the context (DM vs Server)
     is_dm = message.guild is None
     is_mentioned = bot.user in message.mentions
-    
-    is_allowed_server_channel = False
-    if not is_dm:
-        is_allowed_server_channel = is_channel_allowed(message.guild.id, message.channel.id)
+    is_allowed_server_channel = False if is_dm else is_channel_allowed(message.guild.id, message.channel.id)
 
-    # 2. Decide if the bot should reply based on context rules
     should_reply = False
     if is_dm:
-        should_reply = True # Always reply in DMs
+        should_reply = True 
     elif is_mentioned or is_allowed_server_channel:
-        should_reply = True # Reply in servers if mentioned or in a /setchannel
+        should_reply = True 
 
     if should_reply:
-        # Clean the text (remove the @mention tag if it exists so the AI doesn't read its own ID)
         clean_content = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
         
-        # Fallback if someone pings the bot but doesn't type anything
         if not clean_content:
             clean_content = "Hello! You pinged me?"
 
-        # Save to the isolated memory for this specific channel/DM
         add_message_to_history(
             channel_id=message.channel.id, message_id=message.id,
             author_id=message.author.id, content=clean_content,
             timestamp=int(message.created_at.timestamp())
         )
 
-        # Generate and send the response
         async with message.channel.typing():
             response = await generate_ai_response(message.channel.id, clean_content, message.author.id)
             for i in range(0, len(response), 2000):
                 await message.reply(response[i:i+2000], mention_author=False)
 
-    # Make sure slash commands still work
     await bot.process_commands(message)
 
 # -------------------- Flask Web Dashboard (Domain Expansion) --------------------
