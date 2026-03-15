@@ -557,7 +557,7 @@ def index():
 @flask_app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
-    if data and data.get('password') == "11222333444455555":
+    if data and data.get('password') == "mr_yaen":
         session['logged_in'] = True
         return jsonify(success=True)
     return jsonify(success=False), 401
