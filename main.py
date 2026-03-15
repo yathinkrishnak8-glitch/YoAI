@@ -1,454 +1,559 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+import google.generativeai as genai
+from flask import Flask, request, session, jsonify, render_template_string
+import threading
+import sqlite3
 import os
 import random
-import sqlite3
-import threading
 import time
+import asyncio
+import datetime
 import json
-import logging
-from datetime import datetime
+import secrets
+from typing import List, Dict, Any, Optional
 
-import discord
-from discord.ext import commands
-from discord import app_commands
-from flask import Flask, request, jsonify
-
-import google.generativeai as genai
-
-# ==========================================
-# CONFIGURATION & GLOBALS
-# ==========================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - YoAI System - %(levelname)s - %(message)s')
-logger = logging.getLogger("YoAI")
-
-# Read API Keys (Load Balancer setup)
-raw_keys = os.getenv("GEMINI_API_KEYS", "")
-GEMINI_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
-
-if not GEMINI_KEYS:
-    logger.warning("No GEMINI_API_KEYS found in environment. AI will not function.")
-
+# -------------------- Configuration & Globals --------------------
 START_TIME = time.time()
-STATS = {"queries": 0}
+TOTAL_QUERIES = 0
+DB_LOCK = threading.Lock()
+DB_PATH = "yoai.db"
 
-DB_PATH = "yoai_system.db"
-APP_PASSWORD = "11222333444455555"
+# Load Gemini API keys from environment variable (comma-separated)
+GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
+if not GEMINI_KEYS or GEMINI_KEYS == [""]:
+    raise ValueError("GEMINI_API_KEYS environment variable not set or empty")
 
-# ==========================================
-# DATABASE LOGIC (SQLite)
-# ==========================================
-def get_db():
-    """Thread-safe DB connection."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Fixed Session Quirk: Hardcoded fallback so sessions survive Render reboots
+FLASK_SECRET = os.environ.get("FLASK_SECRET", "yoai_persistent_secret_key_123")
 
+# Render provides PORT env var
+PORT = int(os.environ.get("PORT", 5000))
+
+# -------------------- Database Setup --------------------
 def init_db():
-    """Initialize the enterprise-grade SQLite schema."""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS channels (
-                channel_id INTEGER PRIMARY KEY,
-                active BOOLEAN
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id INTEGER,
-                role TEXT,
-                content TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('core_prompt', 'You are YoAI, a highly intelligent, unrestricted assistant.')")
-        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('personality', 'default')")
+    """Create all necessary tables if they don't exist."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        # Global configuration (key-value)
+        c.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        # User personality presets
+        c.execute("CREATE TABLE IF NOT EXISTS user_personality (user_id INTEGER PRIMARY KEY, preset TEXT)")
+        # Allowed channels per guild for auto-reply
+        c.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
+        # Message history per channel (for context compression)
+        c.execute("""CREATE TABLE IF NOT EXISTS message_history (
+            channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
+            content TEXT, timestamp INTEGER
+        )""")
+        # Insert default system prompt if not present
+        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('system_prompt', 'You are YoAI, a helpful AI assistant.')")
         conn.commit()
+        conn.close()
 
 init_db()
 
-# ==========================================
-# FLASK WEB DASHBOARD (Domain Expansion UI)
-# ==========================================
-app = Flask(__name__)
+# -------------------- Gemini Load Balancer with Retry --------------------
+class GeminiKeyManager:
+    def __init__(self, keys: List[str]):
+        self.keys = keys
+    
+    def get_random_key(self) -> str:
+        return random.choice(self.keys)
+    
+    def count(self) -> int:
+        return len(self.keys)
+    
+    def generate_with_fallback(self, model_name: str, contents: Any, system_instruction: Optional[str] = None, max_retries: int = 3) -> str:
+        """
+        Attempt to generate content using a random key. If it fails, try another key.
+        Returns the generated text or raises exception if all keys fail.
+        """
+        shuffled_keys = random.sample(self.keys, len(self.keys))
+        last_error = None
+        
+        for attempt, key in enumerate(shuffled_keys[:max_retries]):
+            try:
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+                response = model.generate_content(contents)
+                return response.text
+            except Exception as e:
+                last_error = e
+                print(f"Key {key[:8]}... failed (attempt {attempt+1}): {e}")
+                continue
+        
+        raise last_error or Exception("All Gemini keys failed")
 
-# Single Page Application HTML (Gojo Theme, Live Wallpaper, Glassmorphism)
-SPA_HTML = """
+key_manager = GeminiKeyManager(GEMINI_KEYS)
+
+# -------------------- Helper Functions --------------------
+def get_system_prompt() -> str:
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT value FROM config WHERE key='system_prompt'")
+        result = c.fetchone()
+        conn.close()
+        return result[0] if result else "You are YoAI, a helpful AI assistant."
+
+def set_system_prompt(prompt: str):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('system_prompt', ?)", (prompt,))
+        conn.commit()
+        conn.close()
+
+def get_user_personality(user_id: int) -> str:
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT preset FROM user_personality WHERE user_id=?", (user_id,))
+        result = c.fetchone()
+        conn.close()
+        return result[0] if result else "default"
+
+def set_user_personality(user_id: int, preset: str):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO user_personality (user_id, preset) VALUES (?, ?)", (user_id, preset))
+        conn.commit()
+        conn.close()
+
+def is_channel_allowed(guild_id: Optional[int], channel_id: int) -> bool:
+    if guild_id is None:
+        return True
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+        result = c.fetchone()
+        conn.close()
+        return result is not None
+
+def add_allowed_channel(guild_id: int, channel_id: int):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (guild_id, channel_id))
+        conn.commit()
+        conn.close()
+
+def remove_allowed_channel(guild_id: int, channel_id: int):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("DELETE FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+        conn.commit()
+        conn.close()
+
+def add_message_to_history(channel_id: int, message_id: int, author_id: int, content: str, timestamp: int):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+                  (channel_id, message_id, author_id, content, timestamp))
+        c.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,))
+        count = c.fetchone()[0]
+        if count > 20:
+            c.execute("""SELECT message_id, author_id, content, timestamp FROM message_history 
+                         WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10""", (channel_id,))
+            oldest = c.fetchall()
+            if oldest:
+                texts = []
+                for mid, aid, cnt, ts in oldest:
+                    if aid != 0:
+                        texts.append(f"User {aid}: {cnt}")
+                if texts:
+                    summary_text = summarize_with_gemini("\n".join(texts))
+                    oldest_ids = [mid for mid, _, _, _ in oldest]
+                    c.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
+                    summary_timestamp = oldest[0][3]
+                    c.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)",
+                              (channel_id, -1, summary_text, summary_timestamp)) 
+        conn.commit()
+        conn.close()
+
+def get_channel_history(channel_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("""SELECT author_id, content, timestamp FROM message_history 
+                     WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT ?""", (channel_id, limit))
+        rows = c.fetchall()
+        conn.close()
+        return [{"author_id": row[0], "content": row[1], "timestamp": row[2]} for row in rows]
+
+def summarize_with_gemini(text: str) -> str:
+    try:
+        return key_manager.generate_with_fallback(
+            model_name='gemini-1.5-flash',
+            contents=f"Summarize the following conversation concisely, preserving key points:\n{text}",
+            max_retries=min(3, key_manager.count())
+        )
+    except Exception as e:
+        print(f"Summarization error after fallback: {e}")
+        return "[Summary unavailable]"
+
+async def generate_ai_response(channel_id: int, user_message: str, author_id: int) -> str:
+    global TOTAL_QUERIES
+    TOTAL_QUERIES += 1
+
+    history = get_channel_history(channel_id, limit=20)
+    
+    context = ""
+    for msg in history:
+        if msg["author_id"] == 0:
+            context += f"[Summary]: {msg['content']}\n"
+        else:
+            context += f"User {msg['author_id']}: {msg['content']}\n"
+    context += f"User {author_id}: {user_message}\nYoAI:"
+
+    system = get_system_prompt()
+    personality = get_user_personality(author_id)
+    if personality == "hacker":
+        system += " Respond like a hacker, using leetspeak and tech jargon."
+    elif personality == "tsundere":
+        system += " Respond like a tsundere anime character, with a mix of harshness and hidden kindness."
+
+    try:
+        response_text = key_manager.generate_with_fallback(
+            model_name='gemini-1.5-flash',
+            contents=context,
+            system_instruction=system,
+            max_retries=min(3, key_manager.count())
+        )
+        return response_text
+    except Exception as e:
+        print(f"AI generation error after fallback: {e}")
+        return "I'm having trouble thinking right now. Please try again later."
+
+# -------------------- Discord Bot --------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+
+class YoAIBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        self.tree = app_commands.CommandTree(self)
+    
+    async def setup_hook(self):
+        await self.tree.sync()
+        print(f"Synced commands for {self.user}")
+
+bot = YoAIBot()
+
+# -------------------- Slash Commands --------------------
+@bot.tree.command(name="core", description="Override the global system prompt")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def core(interaction: discord.Interaction, directive: str):
+    set_system_prompt(directive)
+    await interaction.response.send_message(f"System prompt updated to:\n{directive}", ephemeral=True)
+
+@bot.tree.command(name="personality", description="Choose your interaction style")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.choices(preset=[
+    app_commands.Choice(name="Default", value="default"),
+    app_commands.Choice(name="Hacker", value="hacker"),
+    app_commands.Choice(name="Tsundere", value="tsundere"),
+])
+async def personality(interaction: discord.Interaction, preset: app_commands.Choice[str]):
+    set_user_personality(interaction.user.id, preset.value)
+    await interaction.response.send_message(f"Personality set to **{preset.name}**", ephemeral=True)
+
+@bot.tree.command(name="hack", description="Prank a user with a fake hacking sequence")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def hack(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer()
+    fake_searches = [
+        "how to become a meme lord", "why is my cat ignoring me", "secret discord admin powers",
+        "what does 'sus' really mean", "how to fake being productive", "is water wet?",
+        "how to train your dragon irl", "anime waifu tier list", "how to hack (jk)"
+    ]
+    searches = random.sample(fake_searches, k=3)
+    msg = await interaction.followup.send(f"`Initiating hack on {user.display_name}...`")
+    await asyncio.sleep(1)
+    await msg.edit(content=f"`Bypassing firewalls... [█░░░░░░░░░] 10%`")
+    await asyncio.sleep(1)
+    await msg.edit(content=f"`Cracking passwords... [███░░░░░░░] 30%`")
+    await asyncio.sleep(1)
+    await msg.edit(content=f"`Accessing search history... [██████░░░░] 60%`")
+    await asyncio.sleep(1)
+    await msg.edit(content=f"`Downloading data... [█████████░] 90%`")
+    await asyncio.sleep(1)
+    await msg.edit(content=f"`Hack complete! Leaked search history for {user.display_name}:`\n" +
+                   "\n".join([f"- {s}" for s in searches]))
+
+@bot.tree.command(name="info", description="Bot statistics")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def info(interaction: discord.Interaction):
+    uptime_seconds = int(time.time() - START_TIME)
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+    embed = discord.Embed(title="YoAI System Info", color=0x00ff00)
+    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Active Gemini Keys", value=key_manager.count(), inline=True)
+    embed.add_field(name="Total Queries", value=TOTAL_QUERIES, inline=True)
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM message_history")
+        rows = c.fetchone()[0]
+        conn.close()
+    embed.add_field(name="Memory Rows", value=rows, inline=True)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="setchannel", description="Allow/Disallow bot auto-reply in this channel (Admin only)")
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.default_permissions(manage_channels=True)
+async def setchannel(interaction: discord.Interaction, enabled: bool):
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in servers.", ephemeral=True)
+        return
+    channel = interaction.channel
+    if enabled:
+        add_allowed_channel(interaction.guild_id, channel.id)
+        await interaction.response.send_message(f"✅ YoAI will now auto-reply in {channel.mention}", ephemeral=True)
+    else:
+        remove_allowed_channel(interaction.guild_id, channel.id)
+        await interaction.response.send_message(f"❌ YoAI will no longer auto-reply in {channel.mention}", ephemeral=True)
+
+# -------------------- Message Handling (Auto-reply) --------------------
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author == bot.user:
+        return
+
+    add_message_to_history(
+        channel_id=message.channel.id,
+        message_id=message.id,
+        author_id=message.author.id,
+        content=message.content,
+        timestamp=int(message.created_at.timestamp())
+    )
+
+    should_reply = False
+    if message.guild is None:
+        should_reply = True
+    else:
+        if is_channel_allowed(message.guild.id, message.channel.id):
+            should_reply = True
+
+    if should_reply:
+        async with message.channel.typing():
+            response = await generate_ai_response(message.channel.id, message.content, message.author.id)
+            await message.reply(response)
+
+    await bot.process_commands(message)
+
+# -------------------- Flask Web Dashboard --------------------
+flask_app = Flask(__name__)
+flask_app.secret_key = FLASK_SECRET
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YoAI | Domain Expansion</title>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700&display=swap" rel="stylesheet">
+    <title>YoAI Dashboard</title>
     <style>
-        :root { 
-            --glass: rgba(9, 9, 11, 0.65); 
-            --text: #f8fafc; 
-            --accent-cyan: #22d3ee; 
-            --hollow-purple: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body {
+            background: linear-gradient(135deg, #1e1e2f 0%, #2a2a40 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #fff;
         }
-        body { 
-            margin: 0; padding: 0; font-family: 'Space Grotesk', sans-serif;
-            color: var(--text); display: flex; height: 100vh; overflow: hidden;
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            width: 90%;
+            max-width: 600px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.2);
         }
-        
-        /* Live Video Background */
-        #live-bg {
-            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            object-fit: cover; z-index: -1; filter: brightness(0.35);
+        h1 { text-align: center; margin-bottom: 20px; font-weight: 300; letter-spacing: 2px; }
+        .login-form { display: flex; flex-direction: column; gap: 15px; }
+        input[type="password"] {
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            font-size: 16px;
         }
-
-        /* Glassmorphism Core */
-        .glass {
-            background: var(--glass);
-            backdrop-filter: blur(16px);
-            -webkit-backdrop-filter: blur(16px);
-            border: 1px solid rgba(34, 211, 238, 0.15);
-            border-radius: 16px;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+        input[type="password"]::placeholder { color: rgba(255,255,255,0.6); }
+        button {
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            background: #6c5ce7;
+            color: white;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.3s;
         }
-
-        /* Adaptive Layout */
-        #nav { width: 250px; padding: 20px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; }
-        #content { flex-grow: 1; padding: 40px 40px 40px 0; overflow-y: auto; z-index: 10; }
-        
-        @media (max-width: 768px) {
-            body { flex-direction: column; }
-            #nav { width: auto; height: 60px; flex-direction: row; padding: 15px; margin: 0; justify-content: space-between; align-items: center; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 24px 24px 0 0; border-bottom: none; }
-            #content { padding: 20px; padding-bottom: 120px; margin: 0; }
-            .hide-mobile { display: none; }
+        button:hover { background: #5b4bc4; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
         }
-
-        /* Typography & Components */
-        h1, h2 { 
-            margin-top: 0; background: var(--hollow-purple); 
-            -webkit-background-clip: text; -webkit-text-fill-color: transparent; 
-            text-shadow: 0 0 20px rgba(168, 85, 247, 0.3);
-            text-transform: uppercase; letter-spacing: 2px;
+        .stat-card {
+            background: rgba(0,0,0,0.3);
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            backdrop-filter: blur(5px);
         }
-        .card { padding: 25px; margin-bottom: 25px; transition: transform 0.3s ease; }
-        .card:hover { border-color: rgba(168, 85, 247, 0.5); }
-        
-        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 25px; }
-        .stat-box { text-align: center; padding: 30px 20px; font-size: 1.1rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;}
-        .stat-value { font-size: 3rem; font-weight: bold; margin-top: 10px; color: var(--accent-cyan); text-shadow: 0 0 15px rgba(34, 211, 238, 0.4); }
-        
-        /* Terminal */
-        pre { color: var(--accent-cyan); font-family: monospace; overflow-x: auto; font-size: 1.1rem; text-shadow: 0 0 8px rgba(34, 211, 238, 0.3); }
-
-        /* Login Overlay */
-        #login-overlay {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.8); display: flex; justify-content: center; align-items: center; z-index: 1000;
+        .stat-value { font-size: 2em; font-weight: bold; color: #a8e6cf; }
+        .stat-label { font-size: 0.9em; opacity: 0.8; margin-top: 5px; }
+        .logout-btn {
+            margin-top: 20px;
+            background: #d63031;
         }
-        .login-box { padding: 40px; text-align: center; width: 320px; border: 1px solid rgba(168, 85, 247, 0.4); }
-        input { width: 90%; padding: 12px; margin: 20px 0; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.5); color: white; outline: none; font-family: 'Space Grotesk'; font-size: 1rem; text-align: center;}
-        input:focus { border-color: var(--accent-cyan); }
-        button { width: 100%; padding: 15px; border-radius: 8px; border: none; background: var(--hollow-purple); color: white; font-weight: bold; font-size: 1.1rem; font-family: 'Space Grotesk'; cursor: pointer; transition: 0.3s; text-transform: uppercase; letter-spacing: 1px; }
-        button:hover { box-shadow: 0 0 20px rgba(168, 85, 247, 0.6); transform: scale(1.02); }
+        .logout-btn:hover { background: #c0392b; }
+        @media (max-width: 600px) {
+            .glass-panel { padding: 20px; }
+            .stats-grid { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
-
-    <video autoplay loop muted playsinline id="live-bg">
-        <source src="https://cdn.pixabay.com/video/2020/05/25/40131-424823903_large.mp4" type="video/mp4">
-    </video>
-
-    <div id="login-overlay" class="glass">
-        <div class="login-box glass">
-            <h1>Domain Expansion</h1>
-            <p style="color: #cbd5e1; letter-spacing: 1px;">REMOVE THE BLINDFOLD</p>
-            <input type="password" id="pwd" placeholder="Enter Cursed Passcode">
-            <button onclick="login()">Initialize</button>
-            <p id="err" style="color: #ef4444; display: none; margin-top: 15px;">Access Denied. Weak Cursed Energy.</p>
+    <div class="glass-panel" id="app">
+        <h1>🔐 YoAI System</h1>
+        <div id="login-view">
+            <form class="login-form" onsubmit="login(event)">
+                <input type="password" id="password" placeholder="Enter password" required>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+        <div id="dashboard-view" style="display: none;">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="uptime">-</div>
+                    <div class="stat-label">Uptime</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="queries">-</div>
+                    <div class="stat-label">Total Queries</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="memory">-</div>
+                    <div class="stat-label">Memory Rows</div>
+                </div>
+            </div>
+            <button class="logout-btn" onclick="logout()">Logout</button>
         </div>
     </div>
-
-    <div id="nav" class="glass">
-        <h2 style="margin: 0;">YoAI</h2>
-        <div class="hide-mobile" style="opacity: 0.7; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 2px;">Infinite Void</div>
-        <div class="hide-mobile" style="margin-top: auto; font-size: 0.8rem; opacity: 0.5; color: var(--accent-cyan);">Status: Limitless Active</div>
-    </div>
-
-    <div id="content">
-        <h1>System Telemetry</h1>
-        <div class="stat-grid">
-            <div class="card glass stat-box">
-                <div style="opacity: 0.8;">Domain Uptime</div>
-                <div class="stat-value" id="uptime">0h 0m</div>
-            </div>
-            <div class="card glass stat-box">
-                <div style="opacity: 0.8;">Cursed Queries</div>
-                <div class="stat-value" id="queries">0</div>
-            </div>
-            <div class="card glass stat-box">
-                <div style="opacity: 0.8;">Memory Threads</div>
-                <div class="stat-value" id="memory">0</div>
-            </div>
-        </div>
-        
-        <div class="card glass" style="margin-top: 25px;">
-            <h2>Live Diagnostics</h2>
-            <pre id="logs">> YoAI System initialized.
-> Six Eyes protocol active.
-> Standing by for API telemetry...</pre>
-        </div>
-    </div>
-
     <script>
-        let auth_token = localStorage.getItem('yoai_auth');
-        if(auth_token === 'valid') document.getElementById('login-overlay').style.display = 'none';
-
-        function login() {
-            if(document.getElementById('pwd').value === '11222333444455555') {
-                localStorage.setItem('yoai_auth', 'valid');
-                document.getElementById('login-overlay').style.display = 'none';
+        async function login(event) {
+            event.preventDefault();
+            const pwd = document.getElementById('password').value;
+            const res = await fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: pwd }),
+                credentials: 'same-origin'
+            });
+            if (res.ok) {
+                document.getElementById('login-view').style.display = 'none';
+                document.getElementById('dashboard-view').style.display = 'block';
+                fetchStats();
+                setInterval(fetchStats, 3000);
             } else {
-                document.getElementById('err').style.display = 'block';
+                alert('Invalid password');
             }
         }
 
-        setInterval(() => {
-            if(localStorage.getItem('yoai_auth') !== 'valid') return;
-            
-            fetch('/api/stats')
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('uptime').innerText = data.uptime;
-                    document.getElementById('queries').innerText = data.queries;
-                    document.getElementById('memory').innerText = data.memory_rows;
-                })
-                .catch(err => console.error("Telemetry sync failed.", err));
-        }, 3000);
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats', { credentials: 'same-origin' });
+                if (!res.ok) throw new Error('Not authorized');
+                const data = await res.json();
+                document.getElementById('uptime').innerText = data.uptime;
+                document.getElementById('queries').innerText = data.total_queries;
+                document.getElementById('memory').innerText = data.active_memory_rows;
+            } catch (e) {
+                console.error(e);
+                document.getElementById('login-view').style.display = 'block';
+                document.getElementById('dashboard-view').style.display = 'none';
+            }
+        }
+
+        async function logout() {
+            await fetch('/logout', { method: 'POST', credentials: 'same-origin' });
+            document.getElementById('login-view').style.display = 'block';
+            document.getElementById('dashboard-view').style.display = 'none';
+        }
+
+        window.onload = async () => {
+            const res = await fetch('/api/stats', { credentials: 'same-origin' });
+            if (res.ok) {
+                document.getElementById('login-view').style.display = 'none';
+                document.getElementById('dashboard-view').style.display = 'block';
+                fetchStats();
+                setInterval(fetchStats, 3000);
+            }
+        };
     </script>
 </body>
 </html>
 """
 
-@app.route("/")
+@flask_app.route('/')
 def index():
-    return SPA_HTML
+    return render_template_string(HTML_TEMPLATE)
 
-@app.route("/api/stats")
-def stats():
-    up_seconds = int(time.time() - START_TIME)
-    hours, remainder = divmod(up_seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
-    
-    with get_db() as conn:
-        mem_rows = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
-        
+@flask_app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    if data and data.get('password') == "11222333444455555":
+        session['logged_in'] = True
+        return jsonify(success=True)
+    return jsonify(success=False), 401
+
+@flask_app.route('/logout', methods=['POST'])
+def logout():
+    session.pop('logged_in', None)
+    return jsonify(success=True)
+
+@flask_app.route('/api/stats')
+def api_stats():
+    if not session.get('logged_in'):
+        return jsonify(error="Unauthorized"), 401
+    uptime_seconds = int(time.time() - START_TIME)
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM message_history")
+        rows = c.fetchone()[0]
+        conn.close()
     return jsonify({
-        "uptime": f"{hours}h {minutes}m",
-        "queries": STATS["queries"],
-        "memory_rows": mem_rows
+        "uptime": uptime_str,
+        "total_queries": TOTAL_QUERIES,
+        "active_memory_rows": rows
     })
 
 def run_flask():
-    logger.info("Starting YoAI Domain Expansion Dashboard on port 5000...")
-    app.run(host="0.0.0.0", port=5000, use_reloader=False, debug=False)
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# ==========================================
-# AI LOGIC & LOAD BALANCER
-# ==========================================
-async def get_ai_response(channel_id, user_prompt):
-    if not GEMINI_KEYS:
-        return "⚠️ Error: YoAI System is offline (No API Keys configured)."
-    
-    STATS["queries"] += 1
-    
-    active_key = random.choice(GEMINI_KEYS)
-    genai.configure(api_key=active_key)
-    
-    with get_db() as conn:
-        core = conn.execute("SELECT value FROM settings WHERE key='core_prompt'").fetchone()[0]
-        personality_type = conn.execute("SELECT value FROM settings WHERE key='personality'").fetchone()[0]
-        
-        if personality_type == "hacker":
-            core += "\nRespond like an elite hacker from the 90s. Use terms like 'mainframe', 'jack in', and be slightly arrogant."
-        elif personality_type == "tsundere":
-            core += "\nRespond like a tsundere anime character. You pretend not to care about the user but actually do. Call them 'baka' occasionally."
-            
-        raw_history = conn.execute(
-            "SELECT role, content FROM (SELECT * FROM history WHERE channel_id=? ORDER BY id DESC LIMIT 20) ORDER BY id ASC", 
-            (channel_id,)
-        ).fetchall()
-    
-    formatted_history = []
-    for row in raw_history:
-        gemini_role = "model" if row["role"] == "assistant" else "user"
-        formatted_history.append({"role": gemini_role, "parts": [row["content"]]})
-
-    if len(formatted_history) >= 20:
-        logger.info(f"Triggering Context Compression for channel {channel_id}")
-        model_compress = genai.GenerativeModel('gemini-1.5-flash')
-        old_text = json.dumps([{"role": h["role"], "content": h["parts"][0]} for h in formatted_history[:10]])
-        try:
-            summary = await model_compress.generate_content_async(
-                f"Summarize the following chat history briefly to save tokens. Keep critical context: {old_text}"
-            )
-            with get_db() as conn:
-                conn.execute(
-                    "DELETE FROM history WHERE id IN (SELECT id FROM history WHERE channel_id=? ORDER BY id ASC LIMIT 10)",
-                    (channel_id,)
-                )
-                conn.execute("INSERT INTO history (channel_id, role, content) VALUES (?, ?, ?)", (channel_id, "user", "[SYSTEM SUMMARY OF PREVIOUS CHAT]: " + summary.text))
-                conn.commit()
-            
-            formatted_history = [{"role": "user", "parts": ["[SYSTEM SUMMARY OF PREVIOUS CHAT]: " + summary.text]}] + formatted_history[10:]
-        except Exception as e:
-            logger.error(f"Compression failed: {e}")
-
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=core)
-        chat = model.start_chat(history=formatted_history)
-        response = await chat.send_message_async(user_prompt)
-        
-        with get_db() as conn:
-            conn.execute("INSERT INTO history (channel_id, role, content) VALUES (?, ?, ?)", (channel_id, "user", user_prompt))
-            conn.execute("INSERT INTO history (channel_id, role, content) VALUES (?, ?, ?)", (channel_id, "assistant", response.text))
-            conn.commit()
-            
-        return response.text
-    except Exception as e:
-        logger.error(f"AI Generation Error: {e}")
-        return f"System Error: {str(e)}"
-
-# ==========================================
-# DISCORD BOT LOGIC
-# ==========================================
-class YoAIBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self):
-        logger.info("Syncing Slash Commands globally...")
-        await self.tree.sync()
-        logger.info("Commands synced.")
-
-bot = YoAIBot()
-
-@bot.event
-async def on_ready():
-    logger.info(f"YoAI Discord node online. Logged in as {bot.user}")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Infinite Void"))
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    is_pinged = bot.user in message.mentions
-    
-    with get_db() as conn:
-        active_channel = conn.execute("SELECT active FROM channels WHERE channel_id=?", (message.channel.id,)).fetchone()
-    
-    is_active = active_channel and active_channel[0]
-
-    if is_pinged or is_active or isinstance(message.channel, discord.DMChannel):
-        async with message.channel.typing():
-            prompt = message.content.replace(f'<@{bot.user.id}>', '').strip()
-            reply = await get_ai_response(message.channel.id, prompt)
-            
-            for i in range(0, len(reply), 2000):
-                await message.reply(reply[i:i+2000], mention_author=False)
-
-# --- SLASH COMMANDS ---
-@bot.tree.command(name="core", description="Overrides the bot's base system prompt globally.")
-@app_commands.describe(directive="The new system prompt/directive for the AI")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def core_cmd(interaction: discord.Interaction, directive: str):
-    with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('core_prompt', ?)", (directive,))
-        conn.commit()
-    await interaction.response.send_message(f"✅ Core directive updated to: `{directive}`")
-
-@bot.tree.command(name="personality", description="Change YoAI's personality preset.")
-@app_commands.choices(preset=[
-    app_commands.Choice(name="Default", value="default"),
-    app_commands.Choice(name="Hacker", value="hacker"),
-    app_commands.Choice(name="Tsundere", value="tsundere")
-])
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def personality_cmd(interaction: discord.Interaction, preset: app_commands.Choice[str]):
-    with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('personality', ?)", (preset.value,))
-        conn.commit()
-    await interaction.response.send_message(f"🎭 Personality updated to: **{preset.name}**")
-
-@bot.tree.command(name="hack", description="Simulates a terminal hack and 'leaks' search history.")
-@app_commands.describe(target="The user to hack")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def hack_cmd(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.defer()
-    msg = await interaction.followup.send(f"💻 Initializing brute-force attack on {target.mention}'s mainframe...", wait=True)
-    time.sleep(1.5)
-    await msg.edit(content="🔓 Firewall bypassed. Extracting Chrome history...")
-    time.sleep(1.5)
-    
-    funny_searches = [
-        "how to pretend i know python",
-        "why does my code work but i don't know why",
-        "how to delete system32 safely",
-        "cool hacker names to use on discord",
-        "is it illegal to download ram"
-    ]
-    leaks = random.sample(funny_searches, 3)
-    
-    leak_text = f"**[CLASSIFIED LEAK - {target.display_name}]**\n"
-    for idx, s in enumerate(leaks, 1):
-        leak_text += f"{idx}. `{s}`\n"
-        
-    await msg.edit(content=leak_text)
-
-@bot.tree.command(name="info", description="Displays YoAI System telemetry.")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def info_cmd(interaction: discord.Interaction):
-    up_seconds = int(time.time() - START_TIME)
-    hours, remainder = divmod(up_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    
-    embed = discord.Embed(title="YoAI | Domain Expansion", color=0xa855f7)
-    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="Uptime", value=f"{hours}h {minutes}m {seconds}s", inline=True)
-    embed.add_field(name="Active API Keys", value=f"{len(GEMINI_KEYS)} keys loaded", inline=True)
-    embed.add_field(name="Total AI Queries", value=str(STATS["queries"]), inline=False)
-    embed.set_footer(text="Limitless Protocol Active")
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="setchannel", description="Admin: Allow the bot to read/reply to all messages here.")
-@app_commands.checks.has_permissions(manage_channels=True)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-async def setchannel_cmd(interaction: discord.Interaction, active: bool):
-    with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO channels (channel_id, active) VALUES (?, ?)", (interaction.channel_id, active))
-        conn.commit()
-    
-    status = "now actively listening to" if active else "ignoring"
-    await interaction.response.send_message(f"⚙️ YoAI System is {status} all messages in this channel.")
-
-# ==========================================
-# STARTUP SEQUENCE
-# ==========================================
+# -------------------- Main --------------------
 if __name__ == "__main__":
-    discord_token = os.getenv("DISCORD_BOT_TOKEN")
-    
-    if not discord_token:
-        logger.error("DISCORD_BOT_TOKEN environment variable is missing. Halting.")
-        exit(1)
-        
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    logger.info("Igniting Discord Bot...")
-    bot.run(discord_token)
+    # Fixed Discord Token variable name
+    bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
