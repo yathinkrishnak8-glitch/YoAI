@@ -71,6 +71,26 @@ class GeminiKeyManager:
         self.key_cooldowns = {k: 0.0 for k in self.all_keys}
         self.dead_keys = set()
         self.lock = threading.Lock()
+        
+        # 🔓 SAFETY OVERRIDE: Set all thresholds to BLOCK_NONE
+        self.unrestricted_safety = [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+        ]
     
     def get_stats(self) -> dict:
         with self.lock:
@@ -82,13 +102,11 @@ class GeminiKeyManager:
             return {"total": total, "active": active, "cooldown": cooldown, "dead": dead}
             
     def run_diagnostics(self) -> list:
-        """Pings Google with every loaded key to determine health status."""
         results = []
         for key in self.all_keys:
             masked_key = f"{key[:8]}•••••••••••••••••••••••••••••{key[-4:]}"
             try:
                 client = genai.Client(api_key=key)
-                # Send the smallest possible ping to verify health
                 client.models.generate_content(model='gemini-2.5-flash', contents="ping")
                 
                 with self.lock:
@@ -124,7 +142,13 @@ class GeminiKeyManager:
             for key in available_keys:
                 try:
                     client = genai.Client(api_key=key)
-                    config = types.GenerateContentConfig(system_instruction=system_instruction) if system_instruction else None
+                    
+                    # 🔓 Apply the unrestricted safety settings to the generation config
+                    config = types.GenerateContentConfig(
+                        system_instruction=system_instruction if system_instruction else None,
+                        safety_settings=self.unrestricted_safety
+                    )
+                    
                     response = client.models.generate_content(model=model_name, contents=contents, config=config)
                     return response.text
                 except Exception as e:
@@ -623,6 +647,7 @@ HTML_TEMPLATE = """
                     <pre id="logs">
 [SYS] Initializing YoAI Command Center...
 [SYS] Master authentication accepted.
+[SYS] <span class="highlight">Safety Overrides Online (Filters OFF).</span>
 [SYS] Auto-Optimization & Memory GC running.
 [SYS] Engine: <span id="model-display" class="highlight">Loading...</span>
 [SYS] Standing by for incoming data streams...
@@ -842,7 +867,6 @@ def api_stats():
 @flask_app.route('/api/diagnostics', methods=['POST'])
 def api_diagnostics():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    # Run the deep scan across all keys
     results = key_manager.run_diagnostics()
     return jsonify(success=True, results=results)
 
