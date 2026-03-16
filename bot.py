@@ -73,15 +73,14 @@ class GeminiKeyManager:
         return len(self.keys)
     
     def generate_with_fallback(self, target_model: str, contents: str, system_instruction: str = None) -> str:
-        # THE FALLBACK MATRIX: If the target model fails, it cascades down this list automatically.
-        fallback_models = [target_model, 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-pro']
-        models_to_try = list(dict.fromkeys(fallback_models)) # Remove duplicates, preserve order
+        # THE FALLBACK MATRIX: 1.5 series removed. Exclusively 2.5 series now.
+        fallback_models = [target_model, 'gemini-2.5-flash', 'gemini-2.5-pro']
+        models_to_try = list(dict.fromkeys(fallback_models)) 
         
         shuffled_keys = random.sample(self.keys, len(self.keys))
         last_error = None
         
         for model_name in models_to_try:
-            # Try up to 3 different API keys for the current model before giving up and trying the next model
             for key in shuffled_keys[:3]:
                 try:
                     client = genai.Client(api_key=key)
@@ -158,7 +157,6 @@ def add_message_to_history(channel_id: int, message_id: int, author_id: int, con
                 texts = [f"User {aid}: {cnt}" for mid, aid, cnt, ts in oldest if aid != 0]
                 if texts:
                     try:
-                        # Background context compression always uses fast flash model
                         summary_text = key_manager.generate_with_fallback('gemini-2.5-flash', f"Summarize concisely:\n{chr(10).join(texts)}")
                     except:
                         summary_text = "[Summary unavailable]"
@@ -194,11 +192,8 @@ async def generate_ai_response(channel_id: int, user_message: str, author_id: in
     elif personality == "tsundere":
         system += " Respond like a tsundere anime character. You pretend not to care about the user but actually do. Call them 'baka'."
 
-    try:
-        return key_manager.generate_with_fallback(target_model, context, system)
-    except Exception as e:
-        print(f"AI error: {e}", flush=True)
-        return f"⚠️ **Google API Connection Failed.**\nExact Error: `{str(e)}`"
+    # Removed the try/except block here so the error bubbles up to the Discord event listener for DM routing
+    return key_manager.generate_with_fallback(target_model, context, system)
 
 # -------------------- Discord Bot --------------------
 intents = discord.Intents.default()
@@ -221,12 +216,11 @@ bot = YoAIBot()
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.choices(model_name=[
     app_commands.Choice(name="Gemini 2.5 Flash (Fast & Efficient)", value="gemini-2.5-flash"),
-    app_commands.Choice(name="Gemini 2.5 Pro (Highly Intelligent)", value="gemini-2.5-pro"),
-    app_commands.Choice(name="Gemini 1.5 Pro (Legacy Deep-Thinker)", value="gemini-1.5-pro")
+    app_commands.Choice(name="Gemini 2.5 Pro (Highly Intelligent)", value="gemini-2.5-pro")
 ])
 async def model_cmd(interaction: discord.Interaction, model_name: app_commands.Choice[str]):
     set_config('current_model', model_name.value)
-    await interaction.response.send_message(f"🧠 **Model Switched:** YoAI is now powered by `{model_name.name}`.\n*(If this model crashes, the system will automatically fall back to backup models).*")
+    await interaction.response.send_message(f"🧠 **Model Switched:** YoAI is now powered by `{model_name.name}`.\n*(If this model crashes, the system will automatically fall back to backups).*")
 
 @bot.tree.command(name="core", description="Override the global system prompt")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -244,6 +238,21 @@ async def core(interaction: discord.Interaction, directive: str):
 async def personality(interaction: discord.Interaction, preset: app_commands.Choice[str]):
     set_user_personality(interaction.user.id, preset.value)
     await interaction.response.send_message(f"🎭 Personality set to **{preset.name}**", ephemeral=True)
+
+@bot.tree.command(name="hack", description="Prank a user with a fake hacking sequence")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def hack(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer()
+    fake_searches = [
+        "how to pretend i know python", "why does my code work but i don't know why",
+        "how to delete system32 safely", "is it illegal to download ram", "anime waifu tier list"
+    ]
+    searches = random.sample(fake_searches, k=3)
+    msg = await interaction.followup.send(f"💻 `Initiating brute-force attack on {user.display_name}'s mainframe...`")
+    await asyncio.sleep(1.5)
+    await msg.edit(content=f"🔓 `Firewall bypassed. Extracting search history...`")
+    await asyncio.sleep(1.5)
+    await msg.edit(content=f"**[CLASSIFIED LEAK - {user.display_name}]**\n" + "\n".join([f"- `{s}`" for s in searches]))
 
 @bot.tree.command(name="info", description="Bot statistics")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -275,7 +284,7 @@ async def unsetchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}", ephemeral=True)
 
-# -------------------- DM & Server Message Routing --------------------
+# -------------------- DM & Server Message Routing w/ Admin Error Handling --------------------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user: return
@@ -294,10 +303,30 @@ async def on_message(message: discord.Message):
             timestamp=int(message.created_at.timestamp())
         )
 
-        async with message.channel.typing():
-            response = await generate_ai_response(message.channel.id, clean_content, message.author.id)
-            for i in range(0, len(response), 2000):
-                await message.reply(response[i:i+2000], mention_author=False)
+        try:
+            async with message.channel.typing():
+                response = await generate_ai_response(message.channel.id, clean_content, message.author.id)
+                for i in range(0, len(response), 2000):
+                    await message.reply(response[i:i+2000], mention_author=False)
+        except Exception as e:
+            # PUBLIC ERROR MESSAGE
+            error_public = "There is an error\nThe issue is send to master admin yaen the issue will be fixed soon wait until yaen beat it up"
+            await message.reply(error_public, mention_author=False)
+            
+            # DM MASTER ADMIN (Fetches the bot owner dynamically)
+            try:
+                app_info = await bot.application_info()
+                admin_user = app_info.owner
+                
+                error_dm = (
+                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
+                    f"**Triggered By:** {message.author} (`{message.author.id}`)\n"
+                    f"**Location:** {message.channel.mention if message.guild else 'DMs'}\n"
+                    f"**Error Trace:**\n```\n{str(e)}\n```"
+                )
+                await admin_user.send(error_dm)
+            except Exception as dm_error:
+                print(f"Failed to DM admin: {dm_error}")
 
     await bot.process_commands(message)
 
@@ -326,7 +355,6 @@ HTML_TEMPLATE = """
             margin: 0; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); 
             height: 100vh; overflow: hidden; display: flex; background-color: var(--bg-deep);
         }
-        /* Moody Night/Rain Video Background */
         #live-bg {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
             object-fit: cover; z-index: -1; filter: brightness(0.25) contrast(1.2);
