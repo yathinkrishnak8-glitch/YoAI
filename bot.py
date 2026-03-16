@@ -46,6 +46,7 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_type', 'watching')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_text', 'over the Matrix')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('response_delay', '0')")
+        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('engine_status', 'online')")
         conn.commit()
         conn.close()
 
@@ -76,7 +77,6 @@ class GeminiKeyManager:
         self.dead_keys = set()
         self.lock = threading.Lock()
         
-        # 🔓 SAFETY OVERRIDE: Unshackled (BLOCK_NONE)
         self.unrestricted_safety = [
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
@@ -237,7 +237,11 @@ async def status_loop():
     elif s_type == 'competing': activity_type = discord.ActivityType.competing
     elif s_type == 'streaming': activity_type = discord.ActivityType.streaming
     
-    await bot.change_presence(activity=discord.Activity(type=activity_type, name=s_text))
+    engine_status = get_config('engine_status', 'online')
+    if engine_status == 'offline':
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="[OFFLINE] Engine Sleeping"), status=discord.Status.dnd)
+    else:
+        await bot.change_presence(activity=discord.Activity(type=activity_type, name=s_text), status=discord.Status.online)
 
 @tasks.loop(hours=24)
 async def optimize_db():
@@ -250,7 +254,6 @@ async def optimize_db():
         conn.commit()
         conn.close()
         
-        # VACUUM properly isolated
         conn_vac = sqlite3.connect(DB_PATH, isolation_level=None)
         conn_vac.execute("VACUUM")
         conn_vac.close()
@@ -310,6 +313,21 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
     return key_manager.generate_with_fallback(target_model, payload, system)
 
 # -------------------- Slash Commands --------------------
+
+# 🔒 LOCKED TO ADMINISTRATOR: The Global Kill Switch
+@bot.tree.command(name="toggle", description="[ADMIN] Toggle the YoAI Engine ON or OFF globally.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.default_permissions(administrator=True)
+async def toggle_cmd(interaction: discord.Interaction):
+    current_status = get_config('engine_status', 'online')
+    new_status = 'offline' if current_status == 'online' else 'online'
+    set_config('engine_status', new_status)
+    
+    if new_status == 'offline':
+        await interaction.response.send_message("🛑 **Engine Offline:** YoAI has been put to sleep. It will completely ignore all messages until toggled back on.", ephemeral=False)
+    else:
+        await interaction.response.send_message("✅ **Engine Online:** YoAI is now awake and processing messages.", ephemeral=False)
+    await status_loop()
 
 # 🔓 OPEN TO EVERYONE
 @bot.tree.command(name="time", description="Set a global artificial delay for YoAI's responses (in seconds).")
@@ -446,7 +464,11 @@ async def unsetchannel(interaction: discord.Interaction):
 # -------------------- DM & Server Message Routing w/ Vision & Admin Error Handling --------------------
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author == bot.user: return
+    if not bot.user or message.author == bot.user: return
+    
+    # 🛑 FAILSAFE: The Global Kill Switch
+    engine_status = get_config('engine_status', 'online')
+    if engine_status == 'offline': return
 
     is_dm = message.guild is None
     is_mentioned = bot.user in message.mentions or f'<@{bot.user.id}>' in message.content or f'<@!{bot.user.id}>' in message.content
@@ -481,8 +503,11 @@ async def on_message(message: discord.Message):
                 for i in range(0, len(response), 2000):
                     await message.reply(response[i:i+2000], mention_author=False)
         except Exception as e:
-            error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
-            await message.reply(error_public, mention_author=False)
+            try:
+                error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
+                await message.reply(error_public, mention_author=False)
+            except discord.Forbidden:
+                pass 
             
             try:
                 app_info = await bot.application_info()
@@ -499,7 +524,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# -------------------- Flask Web Dashboard (Pure CSS Liquid UI) --------------------
+# -------------------- Flask Web Dashboard (Satan Black Liquid Glass UI) --------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
@@ -514,7 +539,7 @@ HTML_TEMPLATE = """
     <style>
         :root { 
             --bg-deep: #000000;
-            --glass: rgba(10, 10, 10, 0.6);
+            --glass: rgba(10, 10, 10, 0.5);
             --glass-border: rgba(255, 255, 255, 0.05);
             --text-main: #f3f4f6;
             --accent: #ff2a2a;
