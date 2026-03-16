@@ -76,6 +76,7 @@ class GeminiKeyManager:
         self.dead_keys = set()
         self.lock = threading.Lock()
         
+        # 🔓 SAFETY OVERRIDE: Unshackled (BLOCK_NONE)
         self.unrestricted_safety = [
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
@@ -246,9 +247,13 @@ async def optimize_db():
         c = conn.cursor()
         seven_days_ago = int(time.time()) - 604800
         c.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
-        conn.execute("VACUUM")
         conn.commit()
         conn.close()
+        
+        # VACUUM properly isolated
+        conn_vac = sqlite3.connect(DB_PATH, isolation_level=None)
+        conn_vac.execute("VACUUM")
+        conn_vac.close()
     print("[SYS] Optimization Complete. Database defragmented.")
 
 @bot.event
@@ -422,16 +427,18 @@ async def info(interaction: discord.Interaction):
     embed.set_footer(text="Smart Load Balancer Active")
     await interaction.response.send_message(embed=embed)
 
-# 🔓 OPEN TO EVERYONE
+# 🔒 LOCKED TO MANAGE CHANNELS
 @bot.tree.command(name="setchannel", description="Allow YoAI to automatically read & reply to ALL messages here.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.default_permissions(manage_channels=True)
 async def setchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, True)
     await interaction.response.send_message(f"⚙️ **Activated:** YoAI System is now automatically listening to {interaction.channel.mention}", ephemeral=True)
 
-# 🔓 OPEN TO EVERYONE
+# 🔒 LOCKED TO MANAGE CHANNELS
 @bot.tree.command(name="unsetchannel", description="Stop YoAI from automatically replying in this channel.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.default_permissions(manage_channels=True)
 async def unsetchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}", ephemeral=True)
@@ -492,7 +499,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# -------------------- Flask Web Dashboard (Satan Black Liquid Glass UI) --------------------
+# -------------------- Flask Web Dashboard (Pure CSS Liquid UI) --------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
@@ -507,7 +514,7 @@ HTML_TEMPLATE = """
     <style>
         :root { 
             --bg-deep: #000000;
-            --glass: rgba(10, 10, 10, 0.5);
+            --glass: rgba(10, 10, 10, 0.6);
             --glass-border: rgba(255, 255, 255, 0.05);
             --text-main: #f3f4f6;
             --accent: #ff2a2a;
@@ -520,10 +527,31 @@ HTML_TEMPLATE = """
             margin: 0; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); 
             height: 100vh; overflow: hidden; display: flex; background-color: var(--bg-deep);
         }
+        
+        /* THE PURE CSS SATAN BLACK LIQUID ENGINE */
         #live-bg {
-            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            object-fit: cover; z-index: -1; filter: brightness(0.3) contrast(1.3) grayscale(0.2);
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -2;
+            background: linear-gradient(120deg, #000000, #0a0000, #050000, #140000);
+            background-size: 300% 300%;
+            animation: liquidFlow 15s ease-in-out infinite;
         }
+        .orb {
+            position: fixed; border-radius: 50%; filter: blur(90px); z-index: -1;
+            animation: float 20s infinite ease-in-out alternate;
+        }
+        .orb-1 { width: 50vw; height: 50vw; background: rgba(255, 42, 42, 0.08); top: -10%; left: -10%; }
+        .orb-2 { width: 60vw; height: 60vw; background: rgba(150, 0, 0, 0.06); bottom: -20%; right: -10%; animation-delay: -5s; }
+        
+        @keyframes liquidFlow {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        @keyframes float {
+            0% { transform: translate(0, 0) scale(1); }
+            100% { transform: translate(5vw, 10vh) scale(1.2); }
+        }
+
         .glass {
             background: var(--glass);
             backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px);
@@ -595,9 +623,9 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <video autoplay loop muted playsinline id="live-bg">
-        <source src="https://cdn.pixabay.com/video/2020/05/12/38894-421060934_large.mp4" type="video/mp4">
-    </video>
+    <div id="live-bg"></div>
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
 
     <div id="login-overlay" class="glass visible-flex">
         <div class="login-box glass">
