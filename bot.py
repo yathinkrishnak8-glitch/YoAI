@@ -39,9 +39,13 @@ def init_db():
             channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
             content TEXT, timestamp INTEGER
         )""")
+        # Base Configs
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('system_prompt', 'You are YoAI, a highly intelligent assistant.')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('current_model', 'gemini-2.5-flash')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('global_personality', 'default')")
+        # Customization Configs
+        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_type', 'watching')")
+        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_text', 'over the Matrix')")
         conn.commit()
         conn.close()
 
@@ -72,24 +76,11 @@ class GeminiKeyManager:
         self.dead_keys = set()
         self.lock = threading.Lock()
         
-        # 🔓 SAFETY OVERRIDE: Set all thresholds to BLOCK_NONE
         self.unrestricted_safety = [
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
         ]
     
     def get_stats(self) -> dict:
@@ -108,11 +99,9 @@ class GeminiKeyManager:
             try:
                 client = genai.Client(api_key=key)
                 client.models.generate_content(model='gemini-2.5-flash', contents="ping")
-                
                 with self.lock:
                     if key in self.dead_keys: self.dead_keys.remove(key)
                     self.key_cooldowns[key] = 0.0
-                
                 results.append({"key": masked_key, "status": "ONLINE", "detail": "Healthy & Ready", "color": "#10b981"})
             except Exception as e:
                 error_msg = str(e).lower()
@@ -142,39 +131,29 @@ class GeminiKeyManager:
             for key in available_keys:
                 try:
                     client = genai.Client(api_key=key)
-                    
-                    # 🔓 Apply the unrestricted safety settings to the generation config
                     config = types.GenerateContentConfig(
                         system_instruction=system_instruction if system_instruction else None,
                         safety_settings=self.unrestricted_safety
                     )
-                    
                     response = client.models.generate_content(model=model_name, contents=contents, config=config)
                     return response.text
                 except Exception as e:
                     last_error = e
                     error_msg = str(e).lower()
                     print(f"⚠️ [Model: {model_name}] [Key: {key[:8]}...] Failed: {e}", flush=True)
-                    
                     with self.lock:
                         if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
                             self.key_cooldowns[key] = time.time() + 60.0
-                            print(f"[CLUSTER] Key {key[:8]} placed in 60s Penalty Box.")
                         elif "400" in error_msg or "403" in error_msg or "permission" in error_msg or "invalid" in error_msg:
                             self.dead_keys.add(key)
-                            print(f"[CLUSTER] Key {key[:8]} marked DEAD. Removed from routing pool.")
                     continue
-                    
         raise last_error or Exception("Total cascade failure. All cluster keys are either dead or on cooldown.")
 
 key_manager = GeminiKeyManager(GEMINI_KEYS)
 
 # -------------------- Helper Functions --------------------
-def get_global_personality() -> str:
-    return get_config('global_personality', 'default')
-
-def set_global_personality(preset: str):
-    set_config('global_personality', preset)
+def get_global_personality() -> str: return get_config('global_personality', 'default')
+def set_global_personality(preset: str): set_config('global_personality', preset)
 
 def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
     if guild_id is None: return True
@@ -246,14 +225,19 @@ class YoAIBot(commands.Bot):
 
 bot = YoAIBot()
 
-@tasks.loop(minutes=10)
+# Dynamic Status Loop (Checks DB every 60 seconds)
+@tasks.loop(seconds=60)
 async def status_loop():
-    statuses = [
-        discord.Activity(type=discord.ActivityType.watching, name="over the Matrix"),
-        discord.Activity(type=discord.ActivityType.listening, name="the Rain"),
-        discord.Activity(type=discord.ActivityType.playing, name="with Gemini 2.5 Flash")
-    ]
-    await bot.change_presence(activity=random.choice(statuses))
+    s_type = get_config('status_type', 'watching')
+    s_text = get_config('status_text', 'over the Matrix')
+    
+    activity_type = discord.ActivityType.watching
+    if s_type == 'playing': activity_type = discord.ActivityType.playing
+    elif s_type == 'listening': activity_type = discord.ActivityType.listening
+    elif s_type == 'competing': activity_type = discord.ActivityType.competing
+    elif s_type == 'streaming': activity_type = discord.ActivityType.streaming
+    
+    await bot.change_presence(activity=discord.Activity(type=activity_type, name=s_text))
 
 @tasks.loop(hours=24)
 async def optimize_db():
@@ -379,18 +363,6 @@ async def memory_cmd(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ Memory extraction failed: {e}")
 
-@bot.tree.command(name="hack", description="Prank a user with a fake hacking sequence")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def hack(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer()
-    fake_searches = ["how to pretend i know python", "why does my code work but i don't know why", "anime waifu tier list"]
-    searches = random.sample(fake_searches, k=3)
-    msg = await interaction.followup.send(f"💻 `Initiating brute-force attack on {user.display_name}'s mainframe...`")
-    await asyncio.sleep(1.5)
-    await msg.edit(content=f"🔓 `Firewall bypassed. Extracting search history...`")
-    await asyncio.sleep(1.5)
-    await msg.edit(content=f"**[CLASSIFIED LEAK - {user.display_name}]**\n" + "\n".join([f"- `{s}`" for s in searches]))
-
 @bot.tree.command(name="clear", description="Wipe YoAI's memory for the current channel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def clear_cmd(interaction: discord.Interaction):
@@ -412,7 +384,8 @@ async def info(interaction: discord.Interaction):
     stats = key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="✨ YoAI | Seinen Interface", color=0x4285f4)
+    # Updated color to match the Satan Black / Crimson theme
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine", color=0xff2a2a)
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -486,7 +459,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# -------------------- Flask Web Dashboard (Admin Panel & Telemetry) --------------------
+# -------------------- Flask Web Dashboard (Satan Black Liquid Glass UI) --------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
@@ -496,16 +469,16 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YoAI | System Interface</title>
+    <title>YoAI | Apex Command</title>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;500;700&display=swap" rel="stylesheet">
     <style>
         :root { 
-            --bg-deep: #050505;
-            --glass: rgba(15, 15, 20, 0.85);
-            --glass-border: rgba(255, 255, 255, 0.08);
+            --bg-deep: #000000;
+            --glass: rgba(10, 10, 10, 0.5);
+            --glass-border: rgba(255, 255, 255, 0.05);
             --text-main: #f3f4f6;
-            --gemini-grad: linear-gradient(90deg, #4285f4, #9b72cb, #d96570);
-            --accent-glow: rgba(155, 114, 203, 0.3);
+            --accent: #ff2a2a; /* Crimson Red / Satan Black accent */
+            --accent-glow: rgba(255, 42, 42, 0.4);
             --danger: #ef4444;
             --success: #10b981;
             --warning: #f59e0b;
@@ -514,36 +487,37 @@ HTML_TEMPLATE = """
             margin: 0; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); 
             height: 100vh; overflow: hidden; display: flex; background-color: var(--bg-deep);
         }
+        /* Dark Abstract / Carbon Smoke Video Background */
         #live-bg {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            object-fit: cover; z-index: -1; filter: brightness(0.25) contrast(1.2);
+            object-fit: cover; z-index: -1; filter: brightness(0.3) contrast(1.3) grayscale(0.2);
         }
         .glass {
             background: var(--glass);
-            backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+            backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px);
             border: 1px solid var(--glass-border);
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+            border-radius: 8px; /* Sharp corners for aerodynamic feel */
+            box-shadow: 0 15px 50px rgba(0,0,0,0.9);
         }
         
-        .gemini-text {
-            background: var(--gemini-grad);
-            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        .accent-text {
+            color: var(--accent);
             font-weight: 700; text-transform: uppercase; letter-spacing: 2px;
+            text-shadow: 0 0 15px var(--accent-glow);
         }
 
-        #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; border-top: 3px solid #9b72cb; }
-        .nav-tab { padding: 12px 15px; border-radius: 8px; cursor: pointer; transition: 0.3s; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 0.9rem; border: 1px solid transparent; }
-        .nav-tab:hover { background: rgba(255,255,255,0.05); }
-        .nav-tab.active { background: rgba(155, 114, 203, 0.2); border-color: rgba(155, 114, 203, 0.5); color: #fff; }
+        #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; border-left: 4px solid var(--accent); }
+        .nav-tab { padding: 12px 15px; border-radius: 4px; cursor: pointer; transition: 0.3s; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 0.9rem; border: 1px solid transparent; }
+        .nav-tab:hover { background: rgba(255,255,255,0.03); }
+        .nav-tab.active { background: rgba(255, 42, 42, 0.1); border-color: rgba(255, 42, 42, 0.3); color: #fff; }
 
         #content { flex-grow: 1; padding: 40px 40px 40px 0; overflow-y: auto; z-index: 10; }
         
         @media (max-width: 768px) {
             body { flex-direction: column; }
-            #nav { width: auto; height: auto; flex-direction: row; flex-wrap: wrap; padding: 15px; margin: 0; justify-content: center; gap: 10px; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 20px 20px 0 0; border-top: 1px solid var(--glass-border); }
-            .nav-tab { padding: 8px 12px; font-size: 0.75rem; flex: 1 1 30%; text-align: center; }
-            #content { padding: 25px; padding-bottom: 140px; margin: 0; }
+            #nav { width: auto; height: auto; flex-direction: row; flex-wrap: wrap; padding: 15px; margin: 0; justify-content: center; gap: 10px; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 8px 8px 0 0; border-top: 1px solid var(--glass-border); border-left: none; }
+            .nav-tab { padding: 8px 12px; font-size: 0.75rem; flex: 1 1 22%; text-align: center; }
+            #content { padding: 25px; padding-bottom: 160px; margin: 0; }
             .hide-mobile { display: none; }
         }
 
@@ -552,36 +526,36 @@ HTML_TEMPLATE = """
         
         .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; }
         .stat-box { text-align: center; padding: 30px 20px; }
-        .stat-label { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 2px; opacity: 0.6; }
-        .stat-value { font-size: 3.5rem; font-weight: 300; margin-top: 10px; color: #fff; }
-        .stat-small { font-size: 1rem; opacity: 0.7; margin-top: 5px;}
+        .stat-label { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 2px; opacity: 0.5; }
+        .stat-value { font-size: 3.5rem; font-weight: 300; margin-top: 10px; color: #fff; text-shadow: 0 0 20px rgba(255,255,255,0.1); }
+        .stat-small { font-size: 1rem; opacity: 0.5; margin-top: 5px;}
         
         pre { color: #a1a1aa; font-family: monospace; font-size: 0.95rem; line-height: 1.5; }
-        .highlight { color: #4285f4; font-weight: bold; }
+        .highlight { color: var(--accent); font-weight: bold; }
 
-        label { display: block; margin-bottom: 8px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; }
+        label { display: block; margin-bottom: 8px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; opacity: 0.7; }
         input[type="text"], input[type="password"], textarea, select { 
-            width: 100%; box-sizing: border-box; padding: 14px; margin-bottom: 20px; border-radius: 6px; 
-            border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.6); color: white; 
+            width: 100%; box-sizing: border-box; padding: 14px; margin-bottom: 20px; border-radius: 4px; 
+            border: 1px solid rgba(255,255,255,0.05); background: rgba(0,0,0,0.8); color: white; 
             outline: none; font-family: 'Space Grotesk'; font-size: 1rem; transition: 0.3s;
         }
-        input:focus, textarea:focus, select:focus { border-color: #9b72cb; box-shadow: 0 0 15px var(--accent-glow); }
+        input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); }
         textarea { resize: vertical; min-height: 120px; }
         
-        button { padding: 15px 25px; border-radius: 6px; border: none; background: var(--text-main); color: #000; font-weight: 700; font-size: 1rem; font-family: 'Space Grotesk'; cursor: pointer; transition: 0.3s; text-transform: uppercase; letter-spacing: 1.5px; }
-        button:hover { background: #fff; transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,255,255,0.2); }
-        button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+        button { padding: 15px 25px; border-radius: 4px; border: 1px solid rgba(255,42,42,0.3); background: rgba(255,42,42,0.1); color: #fff; font-weight: 700; font-size: 1rem; font-family: 'Space Grotesk'; cursor: pointer; transition: 0.3s; text-transform: uppercase; letter-spacing: 1.5px; }
+        button:hover { background: var(--accent); box-shadow: 0 0 25px var(--accent-glow); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; border-color: #555; box-shadow: none; color: #555; }
         
-        .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
-        .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 5px 20px rgba(239, 68, 68, 0.4); }
+        .btn-danger { background: rgba(239, 68, 68, 0.05); border: 1px solid var(--danger); color: var(--danger); }
+        .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 0 25px rgba(239, 68, 68, 0.5); }
 
-        .key-row { display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .key-row { display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.02); }
         .key-row:last-child { border-bottom: none; }
         .key-name { font-family: monospace; font-size: 1.1rem; letter-spacing: 1px; color: #cbd5e1; }
-        .badge { padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
+        .badge { padding: 6px 12px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
 
-        #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(5,5,5,0.9); display: flex; justify-content: center; align-items: center; z-index: 1000; }
-        .login-box { padding: 50px; text-align: center; width: 340px; border-top: 3px solid #4285f4; }
+        #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); display: flex; justify-content: center; align-items: center; z-index: 1000; }
+        .login-box { padding: 50px; text-align: center; width: 340px; border-top: 4px solid var(--accent); }
         
         .hidden { display: none !important; }
         .visible-flex { display: flex !important; }
@@ -590,49 +564,50 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <video autoplay loop muted playsinline id="live-bg">
-        <source src="https://cdn.pixabay.com/video/2020/03/19/33894-400492193_large.mp4" type="video/mp4">
+        <source src="https://cdn.pixabay.com/video/2020/05/12/38894-421060934_large.mp4" type="video/mp4">
     </video>
 
     <div id="login-overlay" class="glass visible-flex">
         <div class="login-box glass">
-            <h1 class="gemini-text" style="font-size: 2rem;">✨ YoAI System</h1>
-            <p style="font-size: 0.85rem; letter-spacing: 2px; opacity: 0.5; text-transform: uppercase;">Authentication Required</p>
-            <input type="password" id="pwd" placeholder="Enter Access Code">
-            <button onclick="login()" style="width: 100%;">Enter Matrix</button>
-            <p id="err" style="color: #ef4444; display: none; margin-top: 20px; font-size: 0.9rem;">Access Denied.</p>
+            <h1 class="accent-text" style="font-size: 2.2rem; margin-bottom: 5px;">Apex Command</h1>
+            <p style="font-size: 0.75rem; letter-spacing: 3px; opacity: 0.4; text-transform: uppercase; margin-bottom: 30px;">Ignition Protocol</p>
+            <input type="password" id="pwd" placeholder="Enter Ignition Code">
+            <button onclick="login()" style="width: 100%;">Engage Engine</button>
+            <p id="err" style="color: #ef4444; display: none; margin-top: 20px; font-size: 0.9rem;">Ignition Failed.</p>
         </div>
     </div>
 
     <div id="dashboard-view" class="hidden" style="width: 100%; height: 100%;">
         <div id="nav" class="glass">
             <div class="hide-mobile">
-                <h2 class="gemini-text" style="margin: 0;">✨ YoAI</h2>
-                <div style="opacity: 0.5; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 20px;">Command Center</div>
+                <h2 class="accent-text" style="margin: 0; font-size: 1.8rem;">YoAI</h2>
+                <div style="opacity: 0.4; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 3px; margin-bottom: 20px;">Apex Engine</div>
             </div>
             
             <div class="nav-tab active" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
             <div class="nav-tab" id="tab-diagnostics" onclick="switchTab('diagnostics')">Cluster Health</div>
+            <div class="nav-tab" id="tab-customization" onclick="switchTab('customization')">Customization</div>
             <div class="nav-tab" id="tab-admin" onclick="switchTab('admin')">Admin Panel</div>
             
             <div class="hide-mobile" style="margin-top: auto;">
-                <button class="btn-danger" style="width: 100%; padding: 10px; font-size: 0.8rem;" onclick="logout()">Logout</button>
+                <button class="btn-danger" style="width: 100%; padding: 10px; font-size: 0.8rem;" onclick="logout()">Kill Switch</button>
             </div>
         </div>
 
         <div id="content">
             <div id="section-telemetry" class="visible-block">
-                <h1 class="gemini-text">System Telemetry</h1>
+                <h1 class="accent-text">System Telemetry</h1>
                 <div class="stat-grid">
                     <div class="card glass stat-box">
-                        <div class="stat-label">Uptime</div>
+                        <div class="stat-label">Engine Uptime</div>
                         <div class="stat-value" id="uptime">-</div>
                     </div>
                     <div class="card glass stat-box">
-                        <div class="stat-label">Queries</div>
+                        <div class="stat-label">Data Output</div>
                         <div class="stat-value" id="queries">-</div>
                     </div>
                     <div class="card glass stat-box">
-                        <div class="stat-label">Memory Nodes</div>
+                        <div class="stat-label">Memory Blocks</div>
                         <div class="stat-value" id="memory">-</div>
                     </div>
                     <div class="card glass stat-box">
@@ -645,49 +620,72 @@ HTML_TEMPLATE = """
                 <div class="card glass" style="margin-top: 20px;">
                     <h2 style="font-size: 1.2rem; font-weight: 500; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px;">Live Terminal</h2>
                     <pre id="logs">
-[SYS] Initializing YoAI Command Center...
-[SYS] Master authentication accepted.
-[SYS] <span class="highlight">Safety Overrides Online (Filters OFF).</span>
-[SYS] Auto-Optimization & Memory GC running.
-[SYS] Engine: <span id="model-display" class="highlight">Loading...</span>
-[SYS] Standing by for incoming data streams...
+[SYS] Apex Engine Initialized.
+[SYS] Ignition sequence accepted.
+[SYS] <span class="highlight">Safety Overrides Online (Unshackled).</span>
+[SYS] Aerodynamics & Memory GC optimal.
+[SYS] Engine Block: <span id="model-display" class="highlight">Loading...</span>
+[SYS] Awaiting input signals...
                     </pre>
                 </div>
             </div>
 
             <div id="section-diagnostics" class="hidden">
-                <h1 class="gemini-text">Cluster Diagnostics</h1>
+                <h1 class="accent-text">Cluster Diagnostics</h1>
                 <div class="card glass">
-                    <p style="opacity: 0.8; margin-bottom: 20px; line-height: 1.6;">Run a deep-level diagnostic scan on your entire load-balanced array. This will securely ping Google's servers to verify the exact health, quota status, and validity of every node in your cluster.</p>
+                    <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Execute a high-performance ping across the load-balanced API array. Verifies the RPM and health of all connected Google nodes.</p>
                     <button id="diag-btn" onclick="runDiagnostics()">Initiate Deep Scan</button>
                     
-                    <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.3); border-radius: 8px;">
-                        </div>
+                    <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);">
+                    </div>
+                </div>
+            </div>
+
+            <div id="section-customization" class="hidden">
+                <h1 class="accent-text">Bot Customization</h1>
+                <div class="card glass">
+                    <h2 style="font-size: 1.2rem; margin-bottom: 20px;">Discord Presence (Status)</h2>
+                    <p style="font-size: 0.85rem; opacity: 0.6; margin-bottom: 20px;">Changes what the bot is actively "Doing" on Discord. Updates sync within 60 seconds.</p>
+                    
+                    <label>Activity Type</label>
+                    <select id="cust-status-type">
+                        <option value="playing">Playing</option>
+                        <option value="watching">Watching</option>
+                        <option value="listening">Listening to</option>
+                        <option value="competing">Competing in</option>
+                        <option value="streaming">Streaming</option>
+                    </select>
+                    
+                    <label>Activity Description</label>
+                    <input type="text" id="cust-status-text" placeholder="e.g. over the Matrix, the Rain...">
+                    
+                    <button onclick="saveCustomization()">Push Update to Discord</button>
+                    <span id="save-cust-status" style="margin-left: 15px; color: var(--success); display: none;">✅ Synced!</span>
                 </div>
             </div>
 
             <div id="section-admin" class="hidden">
-                <h1 class="gemini-text">Admin Control Panel</h1>
+                <h1 class="accent-text">Admin Control Panel</h1>
                 <div class="card glass">
                     <h2 style="font-size: 1.2rem; margin-bottom: 20px;">Core Matrix Directives</h2>
                     
                     <label>Global System Prompt</label>
                     <textarea id="admin-prompt" placeholder="You are YoAI..."></textarea>
                     
-                    <label>Primary AI Engine</label>
+                    <label>Primary AI Engine Block</label>
                     <select id="admin-model">
-                        <option value="gemini-2.5-flash">Gemini 2.5 Flash (Fast & Efficient)</option>
-                        <option value="gemini-2.5-pro">Gemini 2.5 Pro (Highly Intelligent)</option>
+                        <option value="gemini-2.5-flash">Gemini 2.5 Flash (V12 Bit-Turbo)</option>
+                        <option value="gemini-2.5-pro">Gemini 2.5 Pro (V12 Supercharged)</option>
                     </select>
                     
                     <button onclick="saveConfig()">Deploy Config</button>
-                    <span id="save-status" style="margin-left: 15px; color: #10b981; display: none;">✅ Saved!</span>
+                    <span id="save-status" style="margin-left: 15px; color: var(--success); display: none;">✅ Saved!</span>
                 </div>
 
                 <div class="card glass" style="border-color: rgba(239, 68, 68, 0.3);">
                     <h2 style="font-size: 1.2rem; color: var(--danger); margin-bottom: 10px;">Danger Zone</h2>
-                    <p style="font-size: 0.9rem; opacity: 0.8; margin-bottom: 20px;">Executing a Hollow Purple will instantly wipe the entire SQLite conversation history across all Discord servers and DMs.</p>
-                    <button class="btn-danger" onclick="nukeMemory()">Execute Hollow Purple (Wipe Memory)</button>
+                    <p style="font-size: 0.9rem; opacity: 0.7; margin-bottom: 20px;">Executing a hard reset will permanently incinerate the entire SQLite conversation history across all environments.</p>
+                    <button class="btn-danger" onclick="nukeMemory()">Incinerate Memory Bank</button>
                 </div>
             </div>
         </div>
@@ -700,7 +698,7 @@ HTML_TEMPLATE = """
         }
 
         function switchTab(tab) {
-            ['telemetry', 'diagnostics', 'admin'].forEach(t => {
+            ['telemetry', 'diagnostics', 'customization', 'admin'].forEach(t => {
                 document.getElementById('tab-' + t).classList.remove('active');
                 document.getElementById('section-' + t).classList.replace('visible-block', 'hidden');
             });
@@ -709,8 +707,9 @@ HTML_TEMPLATE = """
             document.getElementById('section-' + tab).classList.replace('hidden', 'visible-block');
 
             if(tab === 'admin') fetchAdminConfig();
+            if(tab === 'customization') fetchCustomization();
             if(tab === 'diagnostics' && document.getElementById('diag-results').innerHTML === "") {
-                document.getElementById('diag-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.5;'>Awaiting scan initialization...</div>";
+                document.getElementById('diag-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.3;'>Awaiting scan initialization...</div>";
             }
         }
 
@@ -739,8 +738,8 @@ HTML_TEMPLATE = """
             const btn = document.getElementById('diag-btn');
             const resDiv = document.getElementById('diag-results');
             btn.disabled = true;
-            btn.innerText = "Scanning Cluster Nodes...";
-            resDiv.innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.8;'>Sending test packets to Google Mainframe... This may take a moment.</div>";
+            btn.innerText = "Scanning...";
+            resDiv.innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.6;'>Sending packets to Google...</div>";
 
             try {
                 const res = await fetch('/api/diagnostics', { method: 'POST' });
@@ -754,16 +753,16 @@ HTML_TEMPLATE = """
                     row.innerHTML = `
                         <div>
                             <div class="key-name">Node ${index + 1}: ${node.key}</div>
-                            <div style="font-size: 0.8rem; opacity: 0.6; margin-top: 5px;">${node.detail}</div>
+                            <div style="font-size: 0.8rem; opacity: 0.5; margin-top: 5px;">${node.detail}</div>
                         </div>
-                        <div class="badge" style="background: ${node.color}20; color: ${node.color}; border: 1px solid ${node.color}50;">
+                        <div class="badge" style="background: ${node.color}15; color: ${node.color}; border: 1px solid ${node.color}40;">
                             ${node.status}
                         </div>
                     `;
                     resDiv.appendChild(row);
                 });
             } catch (e) {
-                resDiv.innerHTML = `<div style='padding: 20px; text-align: center; color: #ef4444;'>Diagnostic scan failed. Server might be under load.</div>`;
+                resDiv.innerHTML = `<div style='padding: 20px; text-align: center; color: var(--danger);'>Diagnostic scan failed.</div>`;
             }
             btn.innerText = "Initiate Deep Scan";
             btn.disabled = false;
@@ -775,6 +774,15 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 document.getElementById('admin-prompt').value = data.system_prompt;
                 document.getElementById('admin-model').value = data.current_model;
+            }
+        }
+        
+        async function fetchCustomization() {
+            const res = await fetch('/api/config');
+            if (res.ok) {
+                const data = await res.json();
+                document.getElementById('cust-status-type').value = data.status_type;
+                document.getElementById('cust-status-text').value = data.status_text;
             }
         }
 
@@ -791,12 +799,25 @@ HTML_TEMPLATE = """
                 fetchStats(); 
             }
         }
+        
+        async function saveCustomization() {
+            const payload = {
+                status_type: document.getElementById('cust-status-type').value,
+                status_text: document.getElementById('cust-status-text').value
+            };
+            const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            if (res.ok) {
+                const status = document.getElementById('save-cust-status');
+                status.style.display = 'inline';
+                setTimeout(() => status.style.display = 'none', 2000);
+            }
+        }
 
         async function nukeMemory() {
-            if(confirm("WARNING: This will permanently delete all chat history data. Proceed?")) {
+            if(confirm("WARNING: This will incinerate all memory data. Proceed?")) {
                 const res = await fetch('/api/nuke', { method: 'POST' });
                 if(res.ok) {
-                    alert("Memory wiped successfully.");
+                    alert("Memory incinerated successfully.");
                     fetchStats();
                 }
             }
@@ -841,10 +862,8 @@ def api_stats():
     uptime_seconds = int(time.time() - START_TIME)
     uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
     
-    try:
-        db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
-    except:
-        db_size_kb = 0
+    try: db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
+    except: db_size_kb = 0
     
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -857,11 +876,8 @@ def api_stats():
         conn.close()
         
     return jsonify({
-        "uptime": uptime_str,
-        "total_queries": TOTAL_QUERIES,
-        "active_memory_rows": rows,
-        "db_size": db_size_kb,
-        "current_model": current_model
+        "uptime": uptime_str, "total_queries": TOTAL_QUERIES,
+        "active_memory_rows": rows, "db_size": db_size_kb, "current_model": current_model
     })
 
 @flask_app.route('/api/diagnostics', methods=['POST'])
@@ -877,24 +893,26 @@ def api_config():
     if request.method == 'GET':
         sys_prompt = get_config('system_prompt', 'You are YoAI, a highly intelligent assistant.')
         model = get_config('current_model', 'gemini-2.5-flash')
-        return jsonify({"system_prompt": sys_prompt, "current_model": model})
+        s_type = get_config('status_type', 'watching')
+        s_text = get_config('status_text', 'over the Matrix')
+        return jsonify({"system_prompt": sys_prompt, "current_model": model, "status_type": s_type, "status_text": s_text})
     
     if request.method == 'POST':
         data = request.get_json()
         if 'system_prompt' in data: set_config('system_prompt', data['system_prompt'])
         if 'current_model' in data: set_config('current_model', data['current_model'])
+        if 'status_type' in data: set_config('status_type', data['status_type'])
+        if 'status_text' in data: set_config('status_text', data['status_text'])
         return jsonify(success=True)
 
 @flask_app.route('/api/nuke', methods=['POST'])
 def api_nuke():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         conn.execute("DELETE FROM message_history")
         conn.commit()
         conn.close()
-        
     return jsonify(success=True)
 
 def run_flask():
