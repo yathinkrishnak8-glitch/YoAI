@@ -64,39 +64,84 @@ def set_config(key: str, value: str):
         conn.commit()
         conn.close()
 
-# -------------------- Multi-Tier Fallback Load Balancer --------------------
+# -------------------- Smart Cluster Load Balancer --------------------
 class GeminiKeyManager:
     def __init__(self, keys: list):
-        self.keys = [k.strip() for k in keys if k.strip()]
+        self.all_keys = [k.strip() for k in keys if k.strip()]
+        self.key_cooldowns = {k: 0.0 for k in self.all_keys}
+        self.dead_keys = set()
+        self.lock = threading.Lock()
     
-    def count(self) -> int:
-        return len(self.keys)
-    
+    def get_stats(self) -> dict:
+        with self.lock:
+            now = time.time()
+            total = len(self.all_keys)
+            dead = len(self.dead_keys)
+            cooldown = sum(1 for k in self.all_keys if k not in self.dead_keys and self.key_cooldowns[k] > now)
+            active = total - dead - cooldown
+            return {"total": total, "active": active, "cooldown": cooldown, "dead": dead}
+            
+    def run_diagnostics(self) -> list:
+        """Pings Google with every loaded key to determine health status."""
+        results = []
+        for key in self.all_keys:
+            masked_key = f"{key[:8]}•••••••••••••••••••••••••••••{key[-4:]}"
+            try:
+                client = genai.Client(api_key=key)
+                # Send the smallest possible ping to verify health
+                client.models.generate_content(model='gemini-2.5-flash', contents="ping")
+                
+                with self.lock:
+                    if key in self.dead_keys: self.dead_keys.remove(key)
+                    self.key_cooldowns[key] = 0.0
+                
+                results.append({"key": masked_key, "status": "ONLINE", "detail": "Healthy & Ready", "color": "#10b981"})
+            except Exception as e:
+                error_msg = str(e).lower()
+                with self.lock:
+                    if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+                        self.key_cooldowns[key] = time.time() + 60.0
+                        results.append({"key": masked_key, "status": "COOLDOWN", "detail": "Rate Limited / Quota Reached", "color": "#f59e0b"})
+                    else:
+                        self.dead_keys.add(key)
+                        results.append({"key": masked_key, "status": "DEAD", "detail": "Invalid / Forbidden / Deleted", "color": "#ef4444"})
+        return results
+
     def generate_with_fallback(self, target_model: str, contents: list, system_instruction: str = None) -> str:
         fallback_models = [target_model, 'gemini-2.5-flash', 'gemini-2.5-pro']
         models_to_try = list(dict.fromkeys(fallback_models)) 
-        
-        shuffled_keys = random.sample(self.keys, len(self.keys))
         last_error = None
         
         for model_name in models_to_try:
-            for key in shuffled_keys[:3]:
+            with self.lock:
+                now = time.time()
+                available_keys = [k for k in self.all_keys if k not in self.dead_keys and self.key_cooldowns[k] <= now]
+            
+            if not available_keys: continue 
+                
+            random.shuffle(available_keys)
+            
+            for key in available_keys:
                 try:
                     client = genai.Client(api_key=key)
                     config = types.GenerateContentConfig(system_instruction=system_instruction) if system_instruction else None
-                    
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=config
-                    )
+                    response = client.models.generate_content(model=model_name, contents=contents, config=config)
                     return response.text
                 except Exception as e:
                     last_error = e
+                    error_msg = str(e).lower()
                     print(f"⚠️ [Model: {model_name}] [Key: {key[:8]}...] Failed: {e}", flush=True)
+                    
+                    with self.lock:
+                        if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+                            self.key_cooldowns[key] = time.time() + 60.0
+                            print(f"[CLUSTER] Key {key[:8]} placed in 60s Penalty Box.")
+                        elif "400" in error_msg or "403" in error_msg or "permission" in error_msg or "invalid" in error_msg:
+                            self.dead_keys.add(key)
+                            print(f"[CLUSTER] Key {key[:8]} marked DEAD. Removed from routing pool.")
                     continue
                     
-        raise last_error or Exception("Total cascade failure. All models and keys failed.")
+        raise last_error or Exception("Total cascade failure. All cluster keys are either dead or on cooldown.")
 
 key_manager = GeminiKeyManager(GEMINI_KEYS)
 
@@ -186,17 +231,14 @@ async def status_loop():
     ]
     await bot.change_presence(activity=random.choice(statuses))
 
-# ⚙️ AUTO-OPTIMIZATION LOOP (Runs every 24 hours)
 @tasks.loop(hours=24)
 async def optimize_db():
     print("[SYS] Initiating Auto-Optimization & Memory Garbage Collection...")
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        # Prune memories older than 7 days (604800 seconds)
         seven_days_ago = int(time.time()) - 604800
         c.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
-        # SQLite Vacuum defragments the DB to save disk space
         conn.execute("VACUUM")
         conn.commit()
         conn.close()
@@ -205,10 +247,8 @@ async def optimize_db():
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    if not status_loop.is_running():
-        status_loop.start()
-    if not optimize_db.is_running():
-        optimize_db.start()
+    if not status_loop.is_running(): status_loop.start()
+    if not optimize_db.is_running(): optimize_db.start()
 
 # -------------------- The AI Generator --------------------
 async def generate_ai_response(channel: discord.abc.Messageable, user_message: str, author: discord.User, image_parts: list = None) -> str:
@@ -278,7 +318,6 @@ async def personality(interaction: discord.Interaction, prompt: str):
         set_global_personality(prompt.strip())
         await interaction.response.send_message(f"🌍 **Global Personality Updated:** YoAI will now act like this for everyone:\n`{prompt.strip()}`")
 
-# 🧠 NEW: AI MEMORY TRACKING COMMAND
 @bot.tree.command(name="memory", description="Ask YoAI to analyze and summarize what it remembers about this channel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def memory_cmd(interaction: discord.Interaction):
@@ -346,12 +385,16 @@ async def info(interaction: discord.Interaction):
     uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
     current_model = get_config('current_model', 'gemini-2.5-flash')
     
+    stats = key_manager.get_stats()
+    key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
+    
     embed = discord.Embed(title="✨ YoAI | Seinen Interface", color=0x4285f4)
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
+    embed.add_field(name="Cluster Health", value=f"`{key_health}`", inline=True)
     embed.add_field(name="Total AI Queries", value=str(TOTAL_QUERIES), inline=True)
-    embed.set_footer(text="Multi-Tier Fallback Matrix Active")
+    embed.set_footer(text="Smart Load Balancer Active")
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setchannel", description="Allow YoAI to automatically read & reply to ALL messages here.")
@@ -440,6 +483,8 @@ HTML_TEMPLATE = """
             --gemini-grad: linear-gradient(90deg, #4285f4, #9b72cb, #d96570);
             --accent-glow: rgba(155, 114, 203, 0.3);
             --danger: #ef4444;
+            --success: #10b981;
+            --warning: #f59e0b;
         }
         body { 
             margin: 0; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); 
@@ -472,16 +517,16 @@ HTML_TEMPLATE = """
         
         @media (max-width: 768px) {
             body { flex-direction: column; }
-            #nav { width: auto; height: 80px; flex-direction: row; padding: 15px 25px; margin: 0; justify-content: space-around; align-items: center; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 20px 20px 0 0; border-top: 1px solid var(--glass-border); }
-            .nav-tab { padding: 10px; font-size: 0.8rem; text-align: center; }
-            #content { padding: 25px; padding-bottom: 130px; margin: 0; }
+            #nav { width: auto; height: auto; flex-direction: row; flex-wrap: wrap; padding: 15px; margin: 0; justify-content: center; gap: 10px; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 20px 20px 0 0; border-top: 1px solid var(--glass-border); }
+            .nav-tab { padding: 8px 12px; font-size: 0.75rem; flex: 1 1 30%; text-align: center; }
+            #content { padding: 25px; padding-bottom: 140px; margin: 0; }
             .hide-mobile { display: none; }
         }
 
         h1, h2 { margin-top: 0; }
         .card { padding: 25px; margin-bottom: 25px; transition: 0.3s; }
         
-        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
+        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; }
         .stat-box { text-align: center; padding: 30px 20px; }
         .stat-label { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 2px; opacity: 0.6; }
         .stat-value { font-size: 3.5rem; font-weight: 300; margin-top: 10px; color: #fff; }
@@ -501,9 +546,15 @@ HTML_TEMPLATE = """
         
         button { padding: 15px 25px; border-radius: 6px; border: none; background: var(--text-main); color: #000; font-weight: 700; font-size: 1rem; font-family: 'Space Grotesk'; cursor: pointer; transition: 0.3s; text-transform: uppercase; letter-spacing: 1.5px; }
         button:hover { background: #fff; transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,255,255,0.2); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
         
         .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
         .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 5px 20px rgba(239, 68, 68, 0.4); }
+
+        .key-row { display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .key-row:last-child { border-bottom: none; }
+        .key-name { font-family: monospace; font-size: 1.1rem; letter-spacing: 1px; color: #cbd5e1; }
+        .badge { padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
 
         #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(5,5,5,0.9); display: flex; justify-content: center; align-items: center; z-index: 1000; }
         .login-box { padding: 50px; text-align: center; width: 340px; border-top: 3px solid #4285f4; }
@@ -536,6 +587,7 @@ HTML_TEMPLATE = """
             </div>
             
             <div class="nav-tab active" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
+            <div class="nav-tab" id="tab-diagnostics" onclick="switchTab('diagnostics')">Cluster Health</div>
             <div class="nav-tab" id="tab-admin" onclick="switchTab('admin')">Admin Panel</div>
             
             <div class="hide-mobile" style="margin-top: auto;">
@@ -578,6 +630,17 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <div id="section-diagnostics" class="hidden">
+                <h1 class="gemini-text">Cluster Diagnostics</h1>
+                <div class="card glass">
+                    <p style="opacity: 0.8; margin-bottom: 20px; line-height: 1.6;">Run a deep-level diagnostic scan on your entire load-balanced array. This will securely ping Google's servers to verify the exact health, quota status, and validity of every node in your cluster.</p>
+                    <button id="diag-btn" onclick="runDiagnostics()">Initiate Deep Scan</button>
+                    
+                    <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.3); border-radius: 8px;">
+                        </div>
+                </div>
+            </div>
+
             <div id="section-admin" class="hidden">
                 <h1 class="gemini-text">Admin Control Panel</h1>
                 <div class="card glass">
@@ -612,15 +675,18 @@ HTML_TEMPLATE = """
         }
 
         function switchTab(tab) {
-            document.getElementById('tab-telemetry').classList.remove('active');
-            document.getElementById('tab-admin').classList.remove('active');
-            document.getElementById('section-telemetry').classList.replace('visible-block', 'hidden');
-            document.getElementById('section-admin').classList.replace('visible-block', 'hidden');
+            ['telemetry', 'diagnostics', 'admin'].forEach(t => {
+                document.getElementById('tab-' + t).classList.remove('active');
+                document.getElementById('section-' + t).classList.replace('visible-block', 'hidden');
+            });
 
             document.getElementById('tab-' + tab).classList.add('active');
             document.getElementById('section-' + tab).classList.replace('hidden', 'visible-block');
 
             if(tab === 'admin') fetchAdminConfig();
+            if(tab === 'diagnostics' && document.getElementById('diag-results').innerHTML === "") {
+                document.getElementById('diag-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.5;'>Awaiting scan initialization...</div>";
+            }
         }
 
         async function login() {
@@ -642,6 +708,40 @@ HTML_TEMPLATE = """
                 document.getElementById('db-size').innerText = data.db_size;
                 document.getElementById('model-display').innerText = data.current_model.replace("gemini-", "").toUpperCase();
             } catch (e) { toggleUI(false); }
+        }
+
+        async function runDiagnostics() {
+            const btn = document.getElementById('diag-btn');
+            const resDiv = document.getElementById('diag-results');
+            btn.disabled = true;
+            btn.innerText = "Scanning Cluster Nodes...";
+            resDiv.innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.8;'>Sending test packets to Google Mainframe... This may take a moment.</div>";
+
+            try {
+                const res = await fetch('/api/diagnostics', { method: 'POST' });
+                if (!res.ok) throw new Error('Request failed');
+                const data = await res.json();
+                
+                resDiv.innerHTML = "";
+                data.results.forEach((node, index) => {
+                    const row = document.createElement('div');
+                    row.className = 'key-row';
+                    row.innerHTML = `
+                        <div>
+                            <div class="key-name">Node ${index + 1}: ${node.key}</div>
+                            <div style="font-size: 0.8rem; opacity: 0.6; margin-top: 5px;">${node.detail}</div>
+                        </div>
+                        <div class="badge" style="background: ${node.color}20; color: ${node.color}; border: 1px solid ${node.color}50;">
+                            ${node.status}
+                        </div>
+                    `;
+                    resDiv.appendChild(row);
+                });
+            } catch (e) {
+                resDiv.innerHTML = `<div style='padding: 20px; text-align: center; color: #ef4444;'>Diagnostic scan failed. Server might be under load.</div>`;
+            }
+            btn.innerText = "Initiate Deep Scan";
+            btn.disabled = false;
         }
 
         async function fetchAdminConfig() {
@@ -716,7 +816,6 @@ def api_stats():
     uptime_seconds = int(time.time() - START_TIME)
     uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
     
-    # Calculate DB file size in KB
     try:
         db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
     except:
@@ -739,6 +838,13 @@ def api_stats():
         "db_size": db_size_kb,
         "current_model": current_model
     })
+
+@flask_app.route('/api/diagnostics', methods=['POST'])
+def api_diagnostics():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    # Run the deep scan across all keys
+    results = key_manager.run_diagnostics()
+    return jsonify(success=True, results=results)
 
 @flask_app.route('/api/config', methods=['GET', 'POST'])
 def api_config():
