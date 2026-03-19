@@ -27,7 +27,7 @@ QUERY_TIMESTAMPS = []
 DB_PATH = "yoai.db"
 DB_CONN = None
 
-# 🔴 NEW: Anti-Spam Shield to prevent Discord Cloudflare 1015 Bans
+# 🔴 ANTI-SPAM SHIELD: Prevents Discord Cloudflare Bans
 LAST_ALERT_TIME = 0.0
 
 CONFIG_CACHE = {}
@@ -454,7 +454,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 4.1", color=0xff2a2a, description="Advanced Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 4.2", color=0xff2a2a, description="Advanced Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -593,7 +593,69 @@ async def unsetchannel(interaction: discord.Interaction):
     await toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}")
 
-# -------------------- Direct On-Message Routing (Zero Delay) --------------------
+# -------------------- Direct On-Message Routing (Silent Crash Protocol) --------------------
+
+async def process_channel_buffer(channel_id):
+    global LAST_ALERT_TIME
+    
+    await asyncio.sleep(1.0) 
+    if channel_id not in CHANNEL_BUFFERS: return
+    
+    data = CHANNEL_BUFFERS.pop(channel_id)
+    if channel_id in CHANNEL_TIMERS:
+        del CHANNEL_TIMERS[channel_id]
+        
+    channel = data['channel']
+    author = data['author']
+    msg_obj = data['message']
+    combined_content = "\n".join(data['content'])
+    image_parts = data['attachments']
+    
+    try:
+        await add_message_to_history(channel_id, msg_obj.id, author.id, combined_content or "[Sent an Image]", int(msg_obj.created_at.timestamp()))
+        
+        delay = float(get_config('response_delay', '0'))
+        
+        async with channel.typing():
+            if delay > 0:
+                await asyncio.sleep(delay)
+                
+            response = await generate_ai_response(channel, combined_content, author, image_parts)
+            for i in range(0, len(response), 2000):
+                await msg_obj.reply(response[i:i+2000], mention_author=False)
+                
+    except Exception as e:
+        error_msg_str = str(e)
+        
+        # 🔴 SILENT CRASH: No public message sent to channel.
+        # Always log to Web Dashboard database
+        await log_system_error(str(author), error_msg_str)
+        
+        # 🔴 ANTI-SPAM SHIELD: Rate-limit Admin DMs to once every 15 seconds
+        now = time.time()
+        if now - LAST_ALERT_TIME > 15.0:
+            LAST_ALERT_TIME = now
+            try:
+                app_info = await bot.application_info()
+                admin_user = app_info.owner
+                error_dm = (
+                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
+                    f"**Triggered By:** {author} (`{author.id}`)\n"
+                    f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
+                    f"**Error Trace:**\n```\n{error_msg_str}\n```"
+                )
+                await admin_user.send(error_dm)
+            except Exception as dm_error:
+                print(f"Failed to DM admin: {dm_error}")
+            
+    finally:
+        if 'data' in locals(): del data
+        if 'image_parts' in locals(): del image_parts
+        if 'msg_obj' in locals(): del msg_obj
+        if 'channel' in locals(): del channel
+        if 'author' in locals(): del author
+        if 'combined_content' in locals(): del combined_content
+
 @bot.event
 async def on_message(message: discord.Message):
     global LAST_ALERT_TIME
@@ -642,18 +704,14 @@ async def on_message(message: discord.Message):
                     
         except Exception as e:
             error_msg_str = str(e)
+            
+            # 🔴 SILENT CRASH: No public message sent to channel.
             await log_system_error(str(author), error_msg_str)
             
             # 🔴 THE ANTI-SPAM SHIELD (Max 1 alert per 15 seconds)
             now = time.time()
             if now - LAST_ALERT_TIME > 15.0:
                 LAST_ALERT_TIME = now
-                try:
-                    error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
-                    await message.reply(error_public, mention_author=False)
-                except discord.Forbidden:
-                    pass 
-                
                 try:
                     app_info = await bot.application_info()
                     admin_user = app_info.owner
@@ -1141,7 +1199,7 @@ HTML_TEMPLATE = """
                         <li style="--anim-delay: 1.1s">📸 <strong>Multi-Modal Vision Guard:</strong> Automatically rejects huge images (>4MB) from crashing the server.</li>
                         <li style="--anim-delay: 1.2s">🚨 <strong>Anti-Freeze API Shield:</strong> Forces a hard 30-second timeout on Google requests to prevent indefinite bot hangs.</li>
                         <li style="--anim-delay: 1.3s">🌐 <strong>Universal Add Command (/invite):</strong> Secure OAuth2 generation that automatically expels the bot if triggered inside an existing guild.</li>
-                        <li style="--anim-delay: 1.4s">🛡️ <strong>Anti-Spam Discord Guard:</strong> Global 15-second alert cooldown to prevent Discord Cloudflare 1015 IP Bans.</li>
+                        <li style="--anim-delay: 1.4s">🛡️ <strong>Anti-Spam Discord Guard (Silent Crash Protocol):</strong> Suppresses public error messages and rate-limits Admin DMs to guarantee zero Cloudflare IP bans.</li>
                     </ul>
                 </div>
             </div>
