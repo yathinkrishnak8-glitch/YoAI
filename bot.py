@@ -9,6 +9,7 @@ import time
 import asyncio
 import datetime
 import re
+import gc  # 🔴 RAM SAVER: Garbage Collector imported
 
 # NEW GOOGLE SDK
 from google import genai
@@ -113,8 +114,8 @@ class GeminiKeyManager:
             self.all_keys.append(actual_key)
             
         self.key_cooldowns = {k: 0.0 for k in self.all_keys}
-        self.key_usage = {k: [] for k in self.all_keys} # 🚀 Internal Stopwatch Tracker
-        self.current_key_idx = 0 # 🚀 Round-Robin Tracker
+        self.key_usage = {k: [] for k in self.all_keys} 
+        self.current_key_idx = 0 
         self.dead_keys = set()
         self.lock = asyncio.Lock()
         
@@ -199,7 +200,6 @@ class GeminiKeyManager:
                 now = time.time()
                 available_keys = []
                 
-                # 🚀 Internal Stopwatch: Clean out old timestamps & Auto-Bench keys
                 for k in self.all_keys:
                     self.key_usage[k] = [ts for ts in self.key_usage[k] if now - ts < 60.0]
                     if k not in self.dead_keys and self.key_cooldowns[k] <= now and len(self.key_usage[k]) < 14:
@@ -208,7 +208,6 @@ class GeminiKeyManager:
                 if not available_keys: 
                     raise Exception("Cascade Failure: All keys are exhausted (RPM Limit) or dead. No healthy nodes left.")
                 
-                # 🚀 Perfect Round-Robin Logic
                 selected_keys = []
                 for _ in range(len(self.all_keys)):
                     k = self.all_keys[self.current_key_idx % len(self.all_keys)]
@@ -219,7 +218,7 @@ class GeminiKeyManager:
             for key in selected_keys:
                 try:
                     async with self.lock:
-                        self.key_usage[key].append(time.time()) # Log the RPM usage
+                        self.key_usage[key].append(time.time())
 
                     client = genai.Client(api_key=key)
                     config = types.GenerateContentConfig(
@@ -318,7 +317,8 @@ class YoAIBot(commands.Bot):
     async def setup_hook(self):
         await self.tree.sync()
         print(f"Synced commands for {self.user}")
-        bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT, use_reloader=False))
+        # 🔴 BUG FIX: Removed 'use_reloader' as Quart.run_task doesn't accept it
+        bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT))
 
 bot = YoAIBot()
 
@@ -349,7 +349,10 @@ async def optimize_db():
     
     async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
         await db_vac.execute("VACUUM")
-    print("[SYS] Optimization Complete. Database defragmented.")
+        
+    # 🔴 RAM SAVER: Force Python to empty all unreferenced memory
+    collected = gc.collect()
+    print(f"[SYS] Optimization Complete. Database defragmented. Cleared {collected} dead objects from RAM.")
 
 @bot.event
 async def on_ready():
@@ -370,9 +373,8 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
         async with db.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp DESC, message_id DESC LIMIT 10", (channel_id,)) as cursor:
             history = await cursor.fetchall()
             
-    history.reverse() # Back to chronological
+    history.reverse() 
     
-    # 🚀 The Token Diet: 3000 Char Limit
     context_lines = []
     current_chars = 0
     
@@ -551,7 +553,7 @@ async def unsetchannel(interaction: discord.Interaction):
 # -------------------- DM & Server Message Routing w/ Vision & Admin Error Handling --------------------
 
 async def process_channel_buffer(channel_id):
-    await asyncio.sleep(2.0) # 🚀 The Message Debouncer Window
+    await asyncio.sleep(2.0) 
     if channel_id not in CHANNEL_BUFFERS: return
     
     data = CHANNEL_BUFFERS.pop(channel_id)
@@ -564,7 +566,6 @@ async def process_channel_buffer(channel_id):
     combined_content = "\n".join(data['content'])
     image_parts = data['attachments']
     
-    # Store the aggregated message block as one memory input
     await add_message_to_history(channel_id, msg_obj.id, author.id, combined_content or "[Sent an Image]", int(msg_obj.created_at.timestamp()))
     
     try:
@@ -612,6 +613,14 @@ async def process_channel_buffer(channel_id):
                 await admin_user.send(error_dm)
             except Exception as dm_error:
                 print(f"Failed to DM admin: {dm_error}")
+    finally:
+        # 🔴 RAM SAVER: Explicitly delete heavy objects from RAM
+        del data
+        del image_parts
+        del msg_obj
+        del channel
+        del author
+        del combined_content
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -714,7 +723,6 @@ HTML_TEMPLATE = """
             position: relative;
             overflow: hidden;
         }
-        /* Top specular reflection for glass */
         .glass::before {
             content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
             background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
@@ -1001,7 +1009,7 @@ HTML_TEMPLATE = """
         
         let bootLine = 0;
         let lastQueryCount = 0;
-        let configLoaded = false;
+        let configLoaded = false; 
 
         function typeTerminalLine(text, callback) {
             const el = document.getElementById('log-content');
