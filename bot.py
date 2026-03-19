@@ -23,11 +23,12 @@ from google.genai import types
 # -------------------- Configuration & Globals --------------------
 START_TIME = time.time()
 TOTAL_QUERIES = 0
-QUERY_TIMESTAMPS = [] # 🔴 NEW: Live RPM Tracker
+QUERY_TIMESTAMPS = [] 
 DB_PATH = "yoai.db"
-DB_CONN = None
 
 CONFIG_CACHE = {}
+CHANNEL_BUFFERS = {}
+CHANNEL_TIMERS = {}
 
 GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 if not GEMINI_KEYS or GEMINI_KEYS == [""]:
@@ -36,61 +37,60 @@ if not GEMINI_KEYS or GEMINI_KEYS == [""]:
 FLASK_SECRET = os.environ.get("FLASK_SECRET", "yoai_persistent_secret_key_123")
 PORT = int(os.environ.get("PORT", 5000))
 
-# -------------------- Database Setup --------------------
+# -------------------- Database Setup (Anti-Lock Protocol) --------------------
 async def init_db():
-    global DB_CONN
-    if DB_CONN is None:
-        DB_CONN = await aiosqlite.connect(DB_PATH)
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
+        await db.execute("""CREATE TABLE IF NOT EXISTS message_history (
+            channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
+            content TEXT, timestamp INTEGER
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS system_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            user TEXT,
+            trace TEXT
+        )""")
         
-    await DB_CONN.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-    await DB_CONN.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
-    await DB_CONN.execute("""CREATE TABLE IF NOT EXISTS message_history (
-        channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
-        content TEXT, timestamp INTEGER
-    )""")
-    await DB_CONN.execute("""CREATE TABLE IF NOT EXISTS system_errors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp REAL,
-        user TEXT,
-        trace TEXT
-    )""")
-    
-    defaults = {
-        'system_prompt': 'You are YoAI, a highly intelligent assistant.',
-        'current_model': 'gemini-2.5-flash-lite',
-        'global_personality': 'default',
-        'status_type': 'watching',
-        'status_text': 'over the Matrix',
-        'response_delay': '0',
-        'engine_status': 'online',
-        'safety_hate': 'BLOCK_NONE',
-        'safety_harassment': 'BLOCK_NONE',
-        'safety_explicit': 'BLOCK_NONE',
-        'safety_dangerous': 'BLOCK_NONE'
-    }
-    
-    for k, v in defaults.items():
-        await DB_CONN.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
+        defaults = {
+            'system_prompt': 'You are YoAI, a highly intelligent assistant.',
+            'current_model': 'gemini-2.5-flash-lite',
+            'global_personality': 'default',
+            'status_type': 'watching',
+            'status_text': 'over the Matrix',
+            'response_delay': '0',
+            'engine_status': 'online',
+            'safety_hate': 'BLOCK_NONE',
+            'safety_harassment': 'BLOCK_NONE',
+            'safety_explicit': 'BLOCK_NONE',
+            'safety_dangerous': 'BLOCK_NONE'
+        }
         
-    await DB_CONN.commit()
-    
-    async with DB_CONN.execute("SELECT key, value FROM config") as cursor:
-        async for row in cursor:
-            CONFIG_CACHE[row[0]] = row[1]
+        for k, v in defaults.items():
+            await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
+            
+        await db.commit()
+        
+        async with db.execute("SELECT key, value FROM config") as cursor:
+            async for row in cursor:
+                CONFIG_CACHE[row[0]] = row[1]
 
 def get_config(key: str, default: str) -> str:
     return CONFIG_CACHE.get(key, default)
 
 async def set_config(key: str, value: str):
     CONFIG_CACHE[key] = value
-    await DB_CONN.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
-    await DB_CONN.commit()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+        await db.commit()
 
 async def log_system_error(user: str, trace: str):
     try:
-        await DB_CONN.execute("INSERT INTO system_errors (timestamp, user, trace) VALUES (?, ?, ?)", (time.time(), user, trace))
-        await DB_CONN.execute("DELETE FROM system_errors WHERE id NOT IN (SELECT id FROM system_errors ORDER BY id DESC LIMIT 50)")
-        await DB_CONN.commit()
+        async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+            await db.execute("INSERT INTO system_errors (timestamp, user, trace) VALUES (?, ?, ?)", (time.time(), user, trace))
+            await db.execute("DELETE FROM system_errors WHERE id NOT IN (SELECT id FROM system_errors ORDER BY id DESC LIMIT 50)")
+            await db.commit()
     except Exception as e:
         print(f"CRITICAL DB LOGGING ERROR: {e}")
 
@@ -154,7 +154,9 @@ class GeminiKeyManager:
             
             try:
                 client = genai.Client(api_key=key)
-                await client.aio.models.generate_content(model='gemini-2.5-flash-lite', contents="ping")
+                # 🔴 ANTI-FREEZE: API Ping Timeout
+                await asyncio.wait_for(client.aio.models.generate_content(model='gemini-2.5-flash-lite', contents="ping"), timeout=15.0)
+                
                 async with self.lock:
                     if key in self.dead_keys: self.dead_keys.remove(key)
                     self.key_cooldowns[key] = 0.0
@@ -172,7 +174,7 @@ class GeminiKeyManager:
             except Exception as e:
                 error_msg = str(e).lower()
                 async with self.lock:
-                    if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+                    if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg or "timeout" in error_msg:
                         cooldown_time = 60.0
                         try:
                             match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_msg)
@@ -189,7 +191,7 @@ class GeminiKeyManager:
                             "name": obj['name'],
                             "masked_key": masked_key,
                             "status": "COOLDOWN",
-                            "detail": f"Rate Limited",
+                            "detail": f"Rate Limited or Timeout",
                             "unlock_time": unlock_epoch, 
                             "color": "#f59e0b"
                         })
@@ -242,8 +244,14 @@ class GeminiKeyManager:
                         system_instruction=system_instruction if system_instruction else None,
                         safety_settings=dynamic_safety
                     )
-                    response = await client.aio.models.generate_content(model=model_name, contents=contents, config=config)
+                    
+                    # 🔴 ANTI-FREEZE: 30 Second API Timeout Shield
+                    response = await asyncio.wait_for(
+                        client.aio.models.generate_content(model=model_name, contents=contents, config=config),
+                        timeout=30.0
+                    )
                     return response.text
+                    
                 except Exception as e:
                     last_error = e
                     error_msg = str(e).lower()
@@ -251,7 +259,7 @@ class GeminiKeyManager:
                     print(f"⚠️ [Model: {model_name}] [{display_name}] Failed: {e}", flush=True)
                     
                     async with self.lock:
-                        if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+                        if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg or "timeout" in error_msg:
                             cooldown_time = 60.0
                             try:
                                 match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_msg)
@@ -282,39 +290,43 @@ async def background_summarize(channel_id, oldest):
     timestamp = oldest[0][3]
     
     try:
-        await DB_CONN.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
-        await DB_CONN.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)", (channel_id, -1, summary_text, timestamp))
-        await DB_CONN.commit()
+        async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+            await db.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
+            await db.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)", (channel_id, -1, summary_text, timestamp))
+            await db.commit()
     except Exception as e:
         print(f"Compression DB Error: {e}")
 
 # -------------------- Helper Functions --------------------
 async def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
     if guild_id is None: return True
-    async with DB_CONN.execute("SELECT 1 FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id)) as cursor:
-        result = await cursor.fetchone()
-    return result is not None
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        async with db.execute("SELECT 1 FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id)) as cursor:
+            result = await cursor.fetchone()
+        return result is not None
 
 async def toggle_channel(guild_id: int, channel_id: int, enable: bool):
-    if enable:
-        await DB_CONN.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (guild_id, channel_id))
-    else:
-        await DB_CONN.execute("DELETE FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
-    await DB_CONN.commit()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        if enable:
+            await db.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (guild_id, channel_id))
+        else:
+            await db.execute("DELETE FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+        await db.commit()
 
 async def add_message_to_history(channel_id: int, message_id: int, author_id: int, content: str, timestamp: int):
-    await DB_CONN.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (channel_id, message_id, author_id, content, timestamp))
-    await DB_CONN.commit()
-    
-    async with DB_CONN.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,)) as cursor:
-        count = (await cursor.fetchone())[0]
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        await db.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (channel_id, message_id, author_id, content, timestamp))
+        await db.commit()
         
-    if count > 15:
-        async with DB_CONN.execute("SELECT message_id, author_id, content, timestamp FROM message_history WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10", (channel_id,)) as cursor:
-            oldest = await cursor.fetchall()
-        if oldest:
-            bot.loop.create_task(background_summarize(channel_id, oldest))
+        async with db.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,)) as cursor:
+            count = (await cursor.fetchone())[0]
+            
+        if count > 15:
+            async with db.execute("SELECT message_id, author_id, content, timestamp FROM message_history WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10", (channel_id,)) as cursor:
+                oldest = await cursor.fetchall()
+            if oldest:
+                bot.loop.create_task(background_summarize(channel_id, oldest))
 
 def clean_discord_name(name: str) -> str:
     cleaned = "".join(c for c in name if c.isalnum() or c.isspace()).strip()
@@ -360,9 +372,10 @@ async def status_loop():
 async def optimize_db():
     print("[SYS] Initiating Auto-Optimization...")
     try:
-        seven_days_ago = int(time.time()) - 604800
-        await DB_CONN.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
-        await DB_CONN.commit()
+        async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+            seven_days_ago = int(time.time()) - 604800
+            await db.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
+            await db.commit()
             
         collected = gc.collect()
         print(f"[SYS] Optimization Complete. Cleared {collected} dead objects from RAM.")
@@ -384,8 +397,9 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
     guild = getattr(channel, 'guild', None)
     channel_id = channel.id
 
-    async with DB_CONN.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp DESC, message_id DESC LIMIT 10", (channel_id,)) as cursor:
-        history = await cursor.fetchall()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        async with db.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp DESC, message_id DESC LIMIT 10", (channel_id,)) as cursor:
+            history = await cursor.fetchall()
             
     history.reverse() 
     
@@ -523,8 +537,9 @@ async def personality(interaction: discord.Interaction, prompt: str):
 @bot.tree.command(name="clear", description="Wipe YoAI's memory for the current channel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def clear_cmd(interaction: discord.Interaction):
-    await DB_CONN.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
-    await DB_CONN.commit()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        await db.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
+        await db.commit()
     await interaction.response.send_message("🧹 **Memory Wiped.** I have forgotten all recent context in this channel.")
 
 @bot.tree.command(name="memory", description="Ask YoAI to analyze and summarize what it remembers about this channel.")
@@ -534,8 +549,9 @@ async def memory_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     channel_id = interaction.channel_id
     
-    async with DB_CONN.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp ASC", (channel_id,)) as cursor:
-        history = await cursor.fetchall()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        async with db.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp ASC", (channel_id,)) as cursor:
+            history = await cursor.fetchall()
         
     if not history:
         return await interaction.followup.send("🧠 Memory Bank is currently empty for this sector.")
@@ -584,7 +600,69 @@ async def unsetchannel(interaction: discord.Interaction):
     await toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}")
 
-# -------------------- Direct On-Message Routing (Zero Delay) --------------------
+# -------------------- Direct On-Message Routing (Debouncer Fast-Tracked) --------------------
+
+async def process_channel_buffer(channel_id):
+    # 🔴 SUPER-FAST DEBOUNCER: 1.0s delay to instantly catch messages without locking
+    await asyncio.sleep(1.0) 
+    if channel_id not in CHANNEL_BUFFERS: return
+    
+    data = CHANNEL_BUFFERS.pop(channel_id)
+    if channel_id in CHANNEL_TIMERS:
+        del CHANNEL_TIMERS[channel_id]
+        
+    channel = data['channel']
+    author = data['author']
+    msg_obj = data['message']
+    combined_content = "\n".join(data['content'])
+    image_parts = data['attachments']
+    
+    # 🔴 MASTER TRY/EXCEPT: Wrapping the ENTIRE process to catch DB locks instantly
+    try:
+        await add_message_to_history(channel_id, msg_obj.id, author.id, combined_content or "[Sent an Image]", int(msg_obj.created_at.timestamp()))
+        
+        delay = float(get_config('response_delay', '0'))
+        
+        async with channel.typing():
+            if delay > 0:
+                await asyncio.sleep(delay)
+                
+            response = await generate_ai_response(channel, combined_content, author, image_parts)
+            for i in range(0, len(response), 2000):
+                await msg_obj.reply(response[i:i+2000], mention_author=False)
+                
+    except Exception as e:
+        error_msg_str = str(e)
+        
+        try:
+            error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
+            await msg_obj.reply(error_public, mention_author=False)
+        except discord.Forbidden:
+            pass 
+        
+        await log_system_error(str(author), error_msg_str)
+        
+        try:
+            app_info = await bot.application_info()
+            admin_user = app_info.owner
+            error_dm = (
+                f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
+                f"**Triggered By:** {author} (`{author.id}`)\n"
+                f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
+                f"**Error Trace:**\n```\n{error_msg_str}\n```"
+            )
+            await admin_user.send(error_dm)
+        except Exception as dm_error:
+            print(f"Failed to DM admin: {dm_error}")
+            
+    finally:
+        if 'data' in locals(): del data
+        if 'image_parts' in locals(): del image_parts
+        if 'msg_obj' in locals(): del msg_obj
+        if 'channel' in locals(): del channel
+        if 'author' in locals(): del author
+        if 'combined_content' in locals(): del combined_content
+
 @bot.event
 async def on_message(message: discord.Message):
     if not bot.user or message.author == bot.user: return
@@ -601,10 +679,19 @@ async def on_message(message: discord.Message):
         if not clean_content and not message.attachments: 
             clean_content = "Hello! You pinged me?"
 
-        channel = message.channel
-        author = message.author
-        
-        image_parts = []
+        channel_id = message.channel.id
+        if channel_id not in CHANNEL_BUFFERS:
+            CHANNEL_BUFFERS[channel_id] = {
+                'content': [],
+                'attachments': [],
+                'author': message.author,
+                'channel': message.channel,
+                'message': message
+            }
+            
+        if clean_content:
+            CHANNEL_BUFFERS[channel_id]['content'].append(clean_content)
+            
         if message.attachments:
             for att in message.attachments:
                 if att.content_type and att.content_type.startswith('image/'):
@@ -613,44 +700,14 @@ async def on_message(message: discord.Message):
                         continue
                         
                     img_bytes = await att.read()
-                    image_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
+                    CHANNEL_BUFFERS[channel_id]['attachments'].append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
                     
-        await add_message_to_history(channel.id, message.id, author.id, clean_content or "[Sent an Image]", int(message.created_at.timestamp()))
+        CHANNEL_BUFFERS[channel_id]['message'] = message 
         
-        try:
-            delay = float(get_config('response_delay', '0'))
+        if channel_id in CHANNEL_TIMERS:
+            CHANNEL_TIMERS[channel_id].cancel()
             
-            async with channel.typing():
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                    
-                response = await generate_ai_response(channel, clean_content, author, image_parts)
-                for i in range(0, len(response), 2000):
-                    await message.reply(response[i:i+2000], mention_author=False)
-                    
-        except Exception as e:
-            error_msg_str = str(e)
-            
-            try:
-                error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
-                await message.reply(error_public, mention_author=False)
-            except discord.Forbidden:
-                pass 
-            
-            await log_system_error(str(author), error_msg_str)
-            
-            try:
-                app_info = await bot.application_info()
-                admin_user = app_info.owner
-                error_dm = (
-                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
-                    f"**Triggered By:** {author} (`{author.id}`)\n"
-                    f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
-                    f"**Error Trace:**\n```\n{error_msg_str}\n```"
-                )
-                await admin_user.send(error_dm)
-            except Exception as dm_error:
-                print(f"Failed to DM admin: {dm_error}")
+        CHANNEL_TIMERS[channel_id] = bot.loop.create_task(process_channel_buffer(channel_id))
 
     await bot.process_commands(message)
 
@@ -1113,18 +1170,19 @@ HTML_TEMPLATE = """
                 <div class="card glass">
                     <h2 style="font-size: 1.2rem; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px; margin-bottom: 20px;">Complete Feature List</h2>
                     <ul class="feature-list">
-                        <li style="--anim-delay: 0.1s">⚡ <strong>Zero-Delay Direct Async Event Routing:</strong> Instantaneous responses natively processed.</li>
+                        <li style="--anim-delay: 0.1s">⚡ <strong>Zero-Delay Direct Async Event Routing:</strong> Instantaneous responses with strict DB lock prevention.</li>
                         <li style="--anim-delay: 0.2s">⚖️ <strong>Round-Robin API Load Balancer:</strong> Flawlessly rotates Gemini keys to multiply RPM limits.</li>
                         <li style="--anim-delay: 0.3s">⏱️ <strong>Internal Stopwatch Tracking:</strong> Pre-emptively benches keys before Google triggers a Rate Limit.</li>
                         <li style="--anim-delay: 0.4s">🏎️ <strong>Supercar UI Gauges:</strong> Live CSS Tachometers visualizing RPM and RLPD in the Cockpit.</li>
-                        <li style="--anim-delay: 0.5s">🗄️ <strong>Single-Pipeline aiosqlite Database:</strong> Prevents multi-user traffic jams and locks.</li>
+                        <li style="--anim-delay: 0.5s">🗄️ <strong>Isolated aiosqlite Pipelines:</strong> Eliminates global "Database Locked" crashes using strict 15s connection timeouts.</li>
                         <li style="--anim-delay: 0.6s">🗑️ <strong>System Janitor (Trash Analyzer):</strong> Manual GC and SQLite Vacuum tools to prevent Render RAM spikes.</li>
                         <li style="--anim-delay: 0.7s">🛡️ <strong>Dynamic Harms Filter Center:</strong> Live frontend control over Google's censors (Default: Unshackled).</li>
                         <li style="--anim-delay: 0.8s">🧠 <strong>Background Auto-Summarizer:</strong> Seamlessly compresses context history.</li>
                         <li style="--anim-delay: 0.9s">💻 <strong>Live Typewriter Terminal:</strong> Animated backend signal logging.</li>
                         <li style="--anim-delay: 1.0s">🔐 <strong>Master Admin Lock:</strong> Core commands reject unauthorized users silently.</li>
                         <li style="--anim-delay: 1.1s">📸 <strong>Multi-Modal Vision Guard:</strong> Automatically rejects huge images (>4MB) from crashing the server.</li>
-                        <li style="--anim-delay: 1.2s">🌐 <strong>Universal Add Command (/invite):</strong> Auto-expels if triggered locally inside a server to protect privacy.</li>
+                        <li style="--anim-delay: 1.2s">🚨 <strong>Anti-Freeze API Shield:</strong> Forces a hard 30-second timeout on Google requests to prevent indefinite bot hangs.</li>
+                        <li style="--anim-delay: 1.3s">🌐 <strong>Universal Add Command (/invite):</strong> Secure OAuth2 generation that automatically expels the bot if triggered inside an existing guild.</li>
                     </ul>
                 </div>
             </div>
@@ -1224,9 +1282,7 @@ HTML_TEMPLATE = """
             }
         }
         
-        // 🔴 UPDATING SUPERCAR GAUGES 🔴
         function updateGauges(rpm, total_queries) {
-            // RPM METER (Max 100 on the dial)
             const needleRpm = document.getElementById('needle-rpm');
             const valRpm = document.getElementById('val-rpm');
             if(needleRpm && valRpm) {
@@ -1235,7 +1291,6 @@ HTML_TEMPLATE = """
                 needleRpm.style.transform = `translateX(-50%) rotate(${rpmDeg}deg)`;
             }
             
-            // RLPD METER (Dynamic Max)
             const needleRlpd = document.getElementById('needle-rlpd');
             const valRlpd = document.getElementById('val-rlpd');
             if(needleRlpd && valRlpd) {
@@ -1258,7 +1313,6 @@ HTML_TEMPLATE = """
                 document.getElementById('memory').innerText = data.active_memory_rows;
                 document.getElementById('db-size').innerText = data.db_size;
                 
-                // Animate Cockpit Gauges
                 updateGauges(data.rpm, data.total_queries);
                 
                 if (lastQueryCount !== 0 && data.total_queries > lastQueryCount) {
@@ -1580,12 +1634,12 @@ async def api_stats():
     try: db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
     except: db_size_kb = 0
     
-    async with DB_CONN.execute("SELECT COUNT(*) FROM message_history") as cursor:
-        rows = (await cursor.fetchone())[0]
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        async with db.execute("SELECT COUNT(*) FROM message_history") as cursor:
+            rows = (await cursor.fetchone())[0]
             
     current_model = get_config('current_model', 'gemini-2.5-flash-lite')
     
-    # Calculate live RPM
     now = time.time()
     QUERY_TIMESTAMPS[:] = [ts for ts in QUERY_TIMESTAMPS if now - ts < 60.0]
     current_rpm = len(QUERY_TIMESTAMPS)
@@ -1614,7 +1668,7 @@ async def api_sys_gc():
 async def api_sys_vacuum():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
     try:
-        async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
+        async with aiosqlite.connect(DB_PATH, isolation_level=None, timeout=15.0) as db_vac:
             await db_vac.execute("VACUUM")
         return jsonify(success=True)
     except Exception as e:
@@ -1651,8 +1705,9 @@ async def api_config():
 @app.route('/api/errors')
 async def api_errors():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    async with DB_CONN.execute("SELECT timestamp, user, trace FROM system_errors ORDER BY timestamp DESC") as cursor:
-        rows = await cursor.fetchall()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        async with db.execute("SELECT timestamp, user, trace FROM system_errors ORDER BY timestamp DESC") as cursor:
+            rows = await cursor.fetchall()
     
     errors = [{"time": datetime.datetime.fromtimestamp(r[0]).strftime('%Y-%m-%d %H:%M:%S'), "user": r[1], "trace": r[2]} for r in rows]
     return jsonify(errors=errors)
@@ -1660,15 +1715,17 @@ async def api_errors():
 @app.route('/api/clear_errors', methods=['POST'])
 async def api_clear_errors():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    await DB_CONN.execute("DELETE FROM system_errors")
-    await DB_CONN.commit()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        await db.execute("DELETE FROM system_errors")
+        await db.commit()
     return jsonify(success=True)
 
 @app.route('/api/nuke', methods=['POST'])
 async def api_nuke():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    await DB_CONN.execute("DELETE FROM message_history")
-    await DB_CONN.commit()
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
+        await db.execute("DELETE FROM message_history")
+        await db.commit()
     return jsonify(success=True)
 
 if __name__ == "__main__":
