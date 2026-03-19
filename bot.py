@@ -9,10 +9,10 @@ import time
 import asyncio
 import datetime
 import re
-import gc  # 🔴 RAM SAVER: Garbage Collector imported
+import gc  
 
 try:
-    import resource # For deep Linux/Render RAM tracking
+    import resource 
 except ImportError:
     resource = None
 
@@ -23,11 +23,11 @@ from google.genai import types
 # -------------------- Configuration & Globals --------------------
 START_TIME = time.time()
 TOTAL_QUERIES = 0
+QUERY_TIMESTAMPS = [] # 🔴 NEW: Live RPM Tracker
 DB_PATH = "yoai.db"
+DB_CONN = None
 
 CONFIG_CACHE = {}
-CHANNEL_BUFFERS = {}
-CHANNEL_TIMERS = {}
 
 GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 if not GEMINI_KEYS or GEMINI_KEYS == [""]:
@@ -38,58 +38,59 @@ PORT = int(os.environ.get("PORT", 5000))
 
 # -------------------- Database Setup --------------------
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
-        await db.execute("""CREATE TABLE IF NOT EXISTS message_history (
-            channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
-            content TEXT, timestamp INTEGER
-        )""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS system_errors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL,
-            user TEXT,
-            trace TEXT
-        )""")
+    global DB_CONN
+    if DB_CONN is None:
+        DB_CONN = await aiosqlite.connect(DB_PATH)
         
-        defaults = {
-            'system_prompt': 'You are YoAI, a highly intelligent assistant.',
-            'current_model': 'gemini-2.5-flash-lite',
-            'global_personality': 'default',
-            'status_type': 'watching',
-            'status_text': 'over the Matrix',
-            'response_delay': '0',
-            'engine_status': 'online',
-            'safety_hate': 'BLOCK_NONE',
-            'safety_harassment': 'BLOCK_NONE',
-            'safety_explicit': 'BLOCK_NONE',
-            'safety_dangerous': 'BLOCK_NONE'
-        }
+    await DB_CONN.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+    await DB_CONN.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
+    await DB_CONN.execute("""CREATE TABLE IF NOT EXISTS message_history (
+        channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
+        content TEXT, timestamp INTEGER
+    )""")
+    await DB_CONN.execute("""CREATE TABLE IF NOT EXISTS system_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp REAL,
+        user TEXT,
+        trace TEXT
+    )""")
+    
+    defaults = {
+        'system_prompt': 'You are YoAI, a highly intelligent assistant.',
+        'current_model': 'gemini-2.5-flash-lite',
+        'global_personality': 'default',
+        'status_type': 'watching',
+        'status_text': 'over the Matrix',
+        'response_delay': '0',
+        'engine_status': 'online',
+        'safety_hate': 'BLOCK_NONE',
+        'safety_harassment': 'BLOCK_NONE',
+        'safety_explicit': 'BLOCK_NONE',
+        'safety_dangerous': 'BLOCK_NONE'
+    }
+    
+    for k, v in defaults.items():
+        await DB_CONN.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
         
-        for k, v in defaults.items():
-            await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
-            
-        await db.commit()
-        
-        async with db.execute("SELECT key, value FROM config") as cursor:
-            async for row in cursor:
-                CONFIG_CACHE[row[0]] = row[1]
+    await DB_CONN.commit()
+    
+    async with DB_CONN.execute("SELECT key, value FROM config") as cursor:
+        async for row in cursor:
+            CONFIG_CACHE[row[0]] = row[1]
 
 def get_config(key: str, default: str) -> str:
     return CONFIG_CACHE.get(key, default)
 
 async def set_config(key: str, value: str):
     CONFIG_CACHE[key] = value
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
-        await db.commit()
+    await DB_CONN.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+    await DB_CONN.commit()
 
 async def log_system_error(user: str, trace: str):
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT INTO system_errors (timestamp, user, trace) VALUES (?, ?, ?)", (time.time(), user, trace))
-            await db.execute("DELETE FROM system_errors WHERE id NOT IN (SELECT id FROM system_errors ORDER BY id DESC LIMIT 50)")
-            await db.commit()
+        await DB_CONN.execute("INSERT INTO system_errors (timestamp, user, trace) VALUES (?, ?, ?)", (time.time(), user, trace))
+        await DB_CONN.execute("DELETE FROM system_errors WHERE id NOT IN (SELECT id FROM system_errors ORDER BY id DESC LIMIT 50)")
+        await DB_CONN.commit()
     except Exception as e:
         print(f"CRITICAL DB LOGGING ERROR: {e}")
 
@@ -280,41 +281,40 @@ async def background_summarize(channel_id, oldest):
     oldest_ids = [mid for mid, _, _, _ in oldest]
     timestamp = oldest[0][3]
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
-        await db.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)", (channel_id, -1, summary_text, timestamp))
-        await db.commit()
+    try:
+        await DB_CONN.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
+        await DB_CONN.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)", (channel_id, -1, summary_text, timestamp))
+        await DB_CONN.commit()
+    except Exception as e:
+        print(f"Compression DB Error: {e}")
 
 # -------------------- Helper Functions --------------------
 async def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
     if guild_id is None: return True
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id)) as cursor:
-            result = await cursor.fetchone()
-        return result is not None
+    async with DB_CONN.execute("SELECT 1 FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id)) as cursor:
+        result = await cursor.fetchone()
+    return result is not None
 
 async def toggle_channel(guild_id: int, channel_id: int, enable: bool):
-    async with aiosqlite.connect(DB_PATH) as db:
-        if enable:
-            await db.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (guild_id, channel_id))
-        else:
-            await db.execute("DELETE FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
-        await db.commit()
+    if enable:
+        await DB_CONN.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (guild_id, channel_id))
+    else:
+        await DB_CONN.execute("DELETE FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+    await DB_CONN.commit()
 
 async def add_message_to_history(channel_id: int, message_id: int, author_id: int, content: str, timestamp: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-                  (channel_id, message_id, author_id, content, timestamp))
-        await db.commit()
+    await DB_CONN.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (channel_id, message_id, author_id, content, timestamp))
+    await DB_CONN.commit()
+    
+    async with DB_CONN.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,)) as cursor:
+        count = (await cursor.fetchone())[0]
         
-        async with db.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,)) as cursor:
-            count = (await cursor.fetchone())[0]
-            
-        if count > 15:
-            async with db.execute("SELECT message_id, author_id, content, timestamp FROM message_history WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10", (channel_id,)) as cursor:
-                oldest = await cursor.fetchall()
-            if oldest:
-                bot.loop.create_task(background_summarize(channel_id, oldest))
+    if count > 15:
+        async with DB_CONN.execute("SELECT message_id, author_id, content, timestamp FROM message_history WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10", (channel_id,)) as cursor:
+            oldest = await cursor.fetchall()
+        if oldest:
+            bot.loop.create_task(background_summarize(channel_id, oldest))
 
 def clean_discord_name(name: str) -> str:
     cleaned = "".join(c for c in name if c.isalnum() or c.isspace()).strip()
@@ -334,6 +334,7 @@ class YoAIBot(commands.Bot):
     async def setup_hook(self):
         await self.tree.sync()
         print(f"Synced commands for {self.user}")
+        await init_db()
         bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT))
 
 bot = YoAIBot()
@@ -357,39 +358,34 @@ async def status_loop():
 
 @tasks.loop(hours=24)
 async def optimize_db():
-    print("[SYS] Initiating Auto-Optimization & Memory Garbage Collection...")
+    print("[SYS] Initiating Auto-Optimization...")
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            seven_days_ago = int(time.time()) - 604800
-            await db.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
-            await db.commit()
-        
-        async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
-            await db_vac.execute("VACUUM")
+        seven_days_ago = int(time.time()) - 604800
+        await DB_CONN.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
+        await DB_CONN.commit()
             
         collected = gc.collect()
-        print(f"[SYS] Optimization Complete. Database defragmented. Cleared {collected} dead objects from RAM.")
+        print(f"[SYS] Optimization Complete. Cleared {collected} dead objects from RAM.")
     except Exception as e:
         print(f"[SYS] Optimization Error: {e}")
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    await init_db() 
     if not status_loop.is_running(): status_loop.start()
     if not optimize_db.is_running(): optimize_db.start()
 
 # -------------------- The AI Generator --------------------
 async def generate_ai_response(channel: discord.abc.Messageable, user_message: str, author: discord.User, image_parts: list = None) -> str:
-    global TOTAL_QUERIES
+    global TOTAL_QUERIES, QUERY_TIMESTAMPS
     TOTAL_QUERIES += 1
+    QUERY_TIMESTAMPS.append(time.time())
 
     guild = getattr(channel, 'guild', None)
     channel_id = channel.id
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp DESC, message_id DESC LIMIT 10", (channel_id,)) as cursor:
-            history = await cursor.fetchall()
+    async with DB_CONN.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp DESC, message_id DESC LIMIT 10", (channel_id,)) as cursor:
+        history = await cursor.fetchall()
             
     history.reverse() 
     
@@ -433,6 +429,47 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
     return await key_manager.generate_with_fallback(target_model, payload, system)
 
 # -------------------- Slash Commands --------------------
+
+class InfoView(discord.ui.View):
+    def __init__(self):
+        super().__init__()
+        self.add_item(discord.ui.Button(label="Open Web Dashboard", style=discord.ButtonStyle.link, url="https://yoai.onrender.com"))
+
+@bot.tree.command(name="info", description="Bot statistics and control panel.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def info(interaction: discord.Interaction):
+    uptime_seconds = int(time.time() - START_TIME)
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
+    current_model = get_config('current_model', 'gemini-2.5-flash-lite')
+    
+    stats = await key_manager.get_stats()
+    key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
+    
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 4.0", color=0xff2a2a, description="Advanced Asynchronous Matrix System")
+    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
+    embed.add_field(name="Cluster Health", value=f"`{key_health}`", inline=True)
+    embed.add_field(name="Total AI Queries", value=str(TOTAL_QUERIES), inline=True)
+    embed.add_field(name="Architect", value="**mr_yaen (Yathin)**", inline=True)
+    embed.set_footer(text="Smart Load Balancer & Janitor Protocol Active")
+    
+    await interaction.response.send_message(embed=embed, view=InfoView())
+
+@bot.tree.command(name="invite", description="Get the bot's invite link (WARNING: Leaves the server if used inside one!)")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def invite_cmd(interaction: discord.Interaction):
+    client_id = bot.user.id
+    invite_url = f"https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=0&scope=bot%20applications.commands"
+    
+    if interaction.guild:
+        await interaction.response.send_message(f"👋 You used `/invite` inside a server. As requested, I am leaving this Matrix sector immediately!\n\n🔗 **Bring me back (or to another server):**\n{invite_url}")
+        try:
+            await interaction.guild.leave()
+        except Exception as e:
+            print(f"Failed to leave guild: {e}")
+    else:
+        await interaction.response.send_message(f"🔗 **Add YoAI to your server (No Admin Perms Required):**\n{invite_url}")
 
 @bot.tree.command(name="toggle", description="[ADMIN] Toggle the YoAI Engine ON or OFF globally.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -486,9 +523,8 @@ async def personality(interaction: discord.Interaction, prompt: str):
 @bot.tree.command(name="clear", description="Wipe YoAI's memory for the current channel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def clear_cmd(interaction: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
-        await db.commit()
+    await DB_CONN.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
+    await DB_CONN.commit()
     await interaction.response.send_message("🧹 **Memory Wiped.** I have forgotten all recent context in this channel.")
 
 @bot.tree.command(name="memory", description="Ask YoAI to analyze and summarize what it remembers about this channel.")
@@ -498,9 +534,8 @@ async def memory_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     channel_id = interaction.channel_id
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp ASC", (channel_id,)) as cursor:
-            history = await cursor.fetchall()
+    async with DB_CONN.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp ASC", (channel_id,)) as cursor:
+        history = await cursor.fetchall()
         
     if not history:
         return await interaction.followup.send("🧠 Memory Bank is currently empty for this sector.")
@@ -537,25 +572,6 @@ async def hack(interaction: discord.Interaction, user: discord.User):
     await asyncio.sleep(1.5)
     await msg.edit(content=f"**[CLASSIFIED LEAK - {user.display_name}]**\n" + "\n".join([f"- `{s}`" for s in searches]))
 
-@bot.tree.command(name="info", description="Bot statistics")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def info(interaction: discord.Interaction):
-    uptime_seconds = int(time.time() - START_TIME)
-    uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
-    current_model = get_config('current_model', 'gemini-2.5-flash-lite')
-    
-    stats = await key_manager.get_stats()
-    key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
-    
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine", color=0xff2a2a)
-    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="Uptime", value=uptime_str, inline=True)
-    embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
-    embed.add_field(name="Cluster Health", value=f"`{key_health}`", inline=True)
-    embed.add_field(name="Total AI Queries", value=str(TOTAL_QUERIES), inline=True)
-    embed.set_footer(text="Smart Load Balancer Active")
-    await interaction.response.send_message(embed=embed)
-
 @bot.tree.command(name="setchannel", description="Allow YoAI to automatically read & reply to ALL messages here.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 async def setchannel(interaction: discord.Interaction):
@@ -568,69 +584,7 @@ async def unsetchannel(interaction: discord.Interaction):
     await toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}")
 
-# -------------------- DM & Server Message Routing w/ Vision & Admin Error Handling --------------------
-
-async def process_channel_buffer(channel_id):
-    await asyncio.sleep(2.0) 
-    if channel_id not in CHANNEL_BUFFERS: return
-    
-    data = CHANNEL_BUFFERS.pop(channel_id)
-    if channel_id in CHANNEL_TIMERS:
-        del CHANNEL_TIMERS[channel_id]
-        
-    channel = data['channel']
-    author = data['author']
-    msg_obj = data['message']
-    combined_content = "\n".join(data['content'])
-    image_parts = data['attachments']
-    
-    await add_message_to_history(channel_id, msg_obj.id, author.id, combined_content or "[Sent an Image]", int(msg_obj.created_at.timestamp()))
-    
-    try:
-        delay = float(get_config('response_delay', '0'))
-        
-        async with channel.typing():
-            if delay > 0:
-                await asyncio.sleep(delay)
-                
-            response = await generate_ai_response(channel, combined_content, author, image_parts)
-            for i in range(0, len(response), 2000):
-                await msg_obj.reply(response[i:i+2000], mention_author=False)
-                
-    except Exception as e:
-        error_msg_str = str(e)
-        
-        # 🔴 RESTORED RAW HANDLER: No hiding API limits. Tells the chat AND dm's you.
-        try:
-            error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
-            await msg_obj.reply(error_public, mention_author=False)
-        except discord.Forbidden:
-            pass 
-        
-        await log_system_error(str(author), error_msg_str)
-        
-        try:
-            app_info = await bot.application_info()
-            admin_user = app_info.owner
-            error_dm = (
-                f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
-                f"**Triggered By:** {author} (`{author.id}`)\n"
-                f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
-                f"**Error Trace:**\n```\n{error_msg_str}\n```"
-            )
-            await admin_user.send(error_dm)
-        except Exception as dm_error:
-            print(f"Failed to DM admin: {dm_error}")
-            
-    finally:
-        # 🔴 SAFE CLEANUP: Prevents UnboundLocalError
-        if 'data' in locals(): del data
-        if 'image_parts' in locals(): del image_parts
-        if 'msg_obj' in locals(): del msg_obj
-        if 'channel' in locals(): del channel
-        if 'author' in locals(): del author
-        if 'combined_content' in locals(): del combined_content
-
+# -------------------- Direct On-Message Routing (Zero Delay) --------------------
 @bot.event
 async def on_message(message: discord.Message):
     if not bot.user or message.author == bot.user: return
@@ -647,19 +601,10 @@ async def on_message(message: discord.Message):
         if not clean_content and not message.attachments: 
             clean_content = "Hello! You pinged me?"
 
-        channel_id = message.channel.id
-        if channel_id not in CHANNEL_BUFFERS:
-            CHANNEL_BUFFERS[channel_id] = {
-                'content': [],
-                'attachments': [],
-                'author': message.author,
-                'channel': message.channel,
-                'message': message
-            }
-            
-        if clean_content:
-            CHANNEL_BUFFERS[channel_id]['content'].append(clean_content)
-            
+        channel = message.channel
+        author = message.author
+        
+        image_parts = []
         if message.attachments:
             for att in message.attachments:
                 if att.content_type and att.content_type.startswith('image/'):
@@ -668,14 +613,44 @@ async def on_message(message: discord.Message):
                         continue
                         
                     img_bytes = await att.read()
-                    CHANNEL_BUFFERS[channel_id]['attachments'].append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
+                    image_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
                     
-        CHANNEL_BUFFERS[channel_id]['message'] = message 
+        await add_message_to_history(channel.id, message.id, author.id, clean_content or "[Sent an Image]", int(message.created_at.timestamp()))
         
-        if channel_id in CHANNEL_TIMERS:
-            CHANNEL_TIMERS[channel_id].cancel()
+        try:
+            delay = float(get_config('response_delay', '0'))
             
-        CHANNEL_TIMERS[channel_id] = bot.loop.create_task(process_channel_buffer(channel_id))
+            async with channel.typing():
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    
+                response = await generate_ai_response(channel, clean_content, author, image_parts)
+                for i in range(0, len(response), 2000):
+                    await message.reply(response[i:i+2000], mention_author=False)
+                    
+        except Exception as e:
+            error_msg_str = str(e)
+            
+            try:
+                error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
+                await message.reply(error_public, mention_author=False)
+            except discord.Forbidden:
+                pass 
+            
+            await log_system_error(str(author), error_msg_str)
+            
+            try:
+                app_info = await bot.application_info()
+                admin_user = app_info.owner
+                error_dm = (
+                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
+                    f"**Triggered By:** {author} (`{author.id}`)\n"
+                    f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
+                    f"**Error Trace:**\n```\n{error_msg_str}\n```"
+                )
+                await admin_user.send(error_dm)
+            except Exception as dm_error:
+                print(f"Failed to DM admin: {dm_error}")
 
     await bot.process_commands(message)
 
@@ -777,6 +752,43 @@ HTML_TEMPLATE = """
         .stat-label { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 2px; opacity: 0.5; }
         .stat-value { font-size: 3.5rem; font-weight: 300; margin-top: 10px; color: #fff; text-shadow: 0 0 20px rgba(255,255,255,0.1); }
         .stat-small { font-size: 1rem; opacity: 0.5; margin-top: 5px;}
+
+        /* 🔴 NEW: SUPERCAR GAUGES (COCKPIT) 🔴 */
+        .dash-meters { display: flex; justify-content: space-around; flex-wrap: wrap; gap: 30px; margin-bottom: 30px; }
+        .meter-box {
+            position: relative; width: 280px; height: 160px; display: flex; flex-direction: column; align-items: center;
+            background: linear-gradient(180deg, rgba(20,0,0,0.8) 0%, rgba(0,0,0,0.9) 100%);
+            border: 2px solid rgba(255,42,42,0.2); border-radius: 140px 140px 15px 15px;
+            box-shadow: inset 0 20px 30px rgba(255,42,42,0.05), 0 15px 30px rgba(0,0,0,0.8);
+            overflow: hidden;
+        }
+        .meter-track {
+            position: absolute; top: 15px; width: 250px; height: 125px;
+            border: 4px dashed rgba(255,42,42,0.4); border-radius: 125px 125px 0 0;
+            border-bottom: none;
+        }
+        .meter-needle {
+            position: absolute; bottom: 10px; left: 50%; width: 4px; height: 110px;
+            background: linear-gradient(to top, transparent 10%, #ff2a2a 90%);
+            transform-origin: bottom center; transform: translateX(-50%) rotate(-90deg);
+            transition: transform 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+            box-shadow: 0 0 15px #ff2a2a; z-index: 2;
+        }
+        .meter-needle::after {
+            content: ''; position: absolute; top: 0; left: -3px; width: 10px; height: 10px;
+            background: #fff; border-radius: 50%; box-shadow: 0 0 10px #fff;
+        }
+        .meter-center {
+            position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+            width: 30px; height: 30px; background: #111; border: 3px solid #ff2a2a;
+            border-radius: 50%; z-index: 3; box-shadow: 0 0 10px #ff2a2a;
+        }
+        .meter-data {
+            position: absolute; bottom: 20px; text-align: center; z-index: 4;
+            background: rgba(0,0,0,0.7); padding: 2px 10px; border-radius: 6px; border: 1px solid rgba(255,42,42,0.3);
+        }
+        .meter-val { font-size: 1.8rem; font-weight: bold; color: #fff; font-family: monospace; text-shadow: 0 0 10px #ff2a2a; line-height: 1; }
+        .meter-title { font-size: 0.7rem; text-transform: uppercase; color: #aaa; letter-spacing: 2px; }
         
         /* LIVE TERMINAL */
         #logs-container, #error-logs-container { max-height: 250px; overflow-y: auto; padding: 15px; background: rgba(0,0,0,0.6); border: 1px solid rgba(255,42,42,0.2); border-radius: 8px; box-shadow: inset 0 0 20px rgba(0,0,0,1); scroll-behavior: smooth; }
@@ -815,6 +827,25 @@ HTML_TEMPLATE = """
         .visible-block { display: block !important; }
         .animate-in { animation: slideFadeUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
         @keyframes slideFadeUp { from { opacity: 0; transform: translateY(30px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+        /* 🔴 CREDITS FANCY CSS 🔴 */
+        .glitch-name {
+            font-size: 2.8rem; font-weight: 700; color: #fff; text-shadow: 0 0 20px var(--accent);
+            position: relative; display: inline-block; letter-spacing: 2px; margin-bottom: 10px;
+        }
+        .fancy-name {
+            font-size: 2rem; font-weight: bold; color: #cbd5e1;
+            text-shadow: 0 0 15px rgba(255,255,255,0.4); font-style: italic; letter-spacing: 1px;
+        }
+        .feature-list { list-style: none; padding: 0; margin: 0; }
+        .feature-list li {
+            padding: 14px 20px; margin-bottom: 10px; background: rgba(255,255,255,0.03); 
+            border-radius: 8px; border-left: 3px solid var(--accent); font-size: 1.05rem;
+            opacity: 0; transform: translateX(-20px);
+            animation: slideRightIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            animation-delay: var(--anim-delay);
+        }
+        @keyframes slideRightIn { to { opacity: 1; transform: translateX(0); } }
     </style>
 </head>
 <body>
@@ -839,7 +870,8 @@ HTML_TEMPLATE = """
                 <div style="opacity: 0.4; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 3px; margin-bottom: 20px;">Apex Engine</div>
             </div>
             
-            <div class="nav-tab active" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
+            <div class="nav-tab active" id="tab-cockpit" onclick="switchTab('cockpit')">Cockpit</div>
+            <div class="nav-tab" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
             <div class="nav-tab" id="tab-diagnostics" onclick="switchTab('diagnostics')">Cluster Health</div>
             <div class="nav-tab" id="tab-tracker" onclick="switchTab('tracker')">Key Tracker</div>
             <div class="nav-tab" id="tab-trash" onclick="switchTab('trash')">System Janitor</div>
@@ -847,6 +879,7 @@ HTML_TEMPLATE = """
             <div class="nav-tab" id="tab-errors" onclick="switchTab('errors')">Error Logs</div>
             <div class="nav-tab" id="tab-customization" onclick="switchTab('customization')">Customization</div>
             <div class="nav-tab" id="tab-admin" onclick="switchTab('admin')">Admin Panel</div>
+            <div class="nav-tab" id="tab-credits" onclick="switchTab('credits')">Credits & Features</div>
             
             <div class="hide-mobile" style="margin-top: auto;">
                 <button class="btn-danger" style="width: 100%; padding: 10px; font-size: 0.8rem;" onclick="logout()">Kill Switch</button>
@@ -854,7 +887,37 @@ HTML_TEMPLATE = """
         </div>
 
         <div id="content">
-            <div id="section-telemetry" class="visible-block animate-in">
+            
+            <div id="section-cockpit" class="visible-block animate-in">
+                <h1 class="accent-text">Engine Cockpit</h1>
+                <div class="card glass">
+                    <div class="dash-meters">
+                        
+                        <div class="meter-box">
+                            <div class="meter-track"></div>
+                            <div class="meter-needle" id="needle-rpm"></div>
+                            <div class="meter-center"></div>
+                            <div class="meter-data">
+                                <div class="meter-val" id="val-rpm">0</div>
+                                <div class="meter-title">RPM</div>
+                            </div>
+                        </div>
+
+                        <div class="meter-box">
+                            <div class="meter-track"></div>
+                            <div class="meter-needle" id="needle-rlpd"></div>
+                            <div class="meter-center"></div>
+                            <div class="meter-data">
+                                <div class="meter-val" id="val-rlpd">0</div>
+                                <div class="meter-title">RLPD</div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            </div>
+
+            <div id="section-telemetry" class="hidden">
                 <h1 class="accent-text">System Telemetry</h1>
                 <div class="stat-grid">
                     <div class="card glass stat-box">
@@ -1035,6 +1098,37 @@ HTML_TEMPLATE = """
                     <button class="btn-danger" onclick="nukeMemory()">Incinerate Memory Bank</button>
                 </div>
             </div>
+            
+            <div id="section-credits" class="hidden">
+                <h1 class="accent-text">Apex Architecture & Credits</h1>
+                
+                <div class="card glass" style="text-align: center; padding: 40px 20px;">
+                    <h2 style="font-size: 0.9rem; opacity: 0.6; text-transform: uppercase; letter-spacing: 4px; margin-bottom: 10px;">Master Architect & Developer</h2>
+                    <div class="glitch-name">𝕸r_𝖄aen (Yathin)</div>
+                    
+                    <h2 style="font-size: 0.9rem; opacity: 0.6; text-transform: uppercase; letter-spacing: 4px; margin-top: 50px; margin-bottom: 10px;">Lead Testing Partner</h2>
+                    <div class="fancy-name">✨ ℜhys ✨</div>
+                </div>
+
+                <div class="card glass">
+                    <h2 style="font-size: 1.2rem; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px; margin-bottom: 20px;">Complete Feature List</h2>
+                    <ul class="feature-list">
+                        <li style="--anim-delay: 0.1s">⚡ <strong>Zero-Delay Direct Async Event Routing:</strong> Instantaneous responses natively processed.</li>
+                        <li style="--anim-delay: 0.2s">⚖️ <strong>Round-Robin API Load Balancer:</strong> Flawlessly rotates Gemini keys to multiply RPM limits.</li>
+                        <li style="--anim-delay: 0.3s">⏱️ <strong>Internal Stopwatch Tracking:</strong> Pre-emptively benches keys before Google triggers a Rate Limit.</li>
+                        <li style="--anim-delay: 0.4s">🏎️ <strong>Supercar UI Gauges:</strong> Live CSS Tachometers visualizing RPM and RLPD in the Cockpit.</li>
+                        <li style="--anim-delay: 0.5s">🗄️ <strong>Single-Pipeline aiosqlite Database:</strong> Prevents multi-user traffic jams and locks.</li>
+                        <li style="--anim-delay: 0.6s">🗑️ <strong>System Janitor (Trash Analyzer):</strong> Manual GC and SQLite Vacuum tools to prevent Render RAM spikes.</li>
+                        <li style="--anim-delay: 0.7s">🛡️ <strong>Dynamic Harms Filter Center:</strong> Live frontend control over Google's censors (Default: Unshackled).</li>
+                        <li style="--anim-delay: 0.8s">🧠 <strong>Background Auto-Summarizer:</strong> Seamlessly compresses context history.</li>
+                        <li style="--anim-delay: 0.9s">💻 <strong>Live Typewriter Terminal:</strong> Animated backend signal logging.</li>
+                        <li style="--anim-delay: 1.0s">🔐 <strong>Master Admin Lock:</strong> Core commands reject unauthorized users silently.</li>
+                        <li style="--anim-delay: 1.1s">📸 <strong>Multi-Modal Vision Guard:</strong> Automatically rejects huge images (>4MB) from crashing the server.</li>
+                        <li style="--anim-delay: 1.2s">🌐 <strong>Universal Add Command (/invite):</strong> Auto-expels if triggered locally inside a server to protect privacy.</li>
+                    </ul>
+                </div>
+            </div>
+            
         </div>
     </div>
 
@@ -1044,7 +1138,7 @@ HTML_TEMPLATE = """
             "[SYS] Matrix Connection Established.",
             "[SYS] CSS Liquid Glass Animations: MOUNTED.",
             "[SYS] Dynamic Safety Overrides: ONLINE.",
-            "[SYS] Dynamic Key RPM Tracker: INITIALIZED.",
+            "[SYS] Supercar Gauge UI: ACTIVE.",
             "[SYS] Memory Garbage Collector: SECURED.",
             "[SYS] Standing by for incoming signals."
         ];
@@ -1052,6 +1146,7 @@ HTML_TEMPLATE = """
         let bootLine = 0;
         let lastQueryCount = 0;
         let configLoaded = false; 
+        
         let cooldownIntervals = {};
 
         function typeTerminalLine(text, callback) {
@@ -1088,7 +1183,7 @@ HTML_TEMPLATE = """
         }
 
         function switchTab(tab) {
-            ['telemetry', 'diagnostics', 'tracker', 'trash', 'safety', 'errors', 'customization', 'admin'].forEach(t => {
+            ['cockpit', 'telemetry', 'diagnostics', 'tracker', 'trash', 'safety', 'errors', 'customization', 'admin', 'credits'].forEach(t => {
                 document.getElementById('tab-' + t).classList.remove('active');
                 let section = document.getElementById('section-' + t);
                 section.classList.replace('visible-block', 'hidden');
@@ -1128,6 +1223,28 @@ HTML_TEMPLATE = """
                 err.animate([{transform: 'translateX(-5px)'}, {transform: 'translateX(5px)'}, {transform: 'translateX(0)'}], {duration: 300});
             }
         }
+        
+        // 🔴 UPDATING SUPERCAR GAUGES 🔴
+        function updateGauges(rpm, total_queries) {
+            // RPM METER (Max 100 on the dial)
+            const needleRpm = document.getElementById('needle-rpm');
+            const valRpm = document.getElementById('val-rpm');
+            if(needleRpm && valRpm) {
+                valRpm.innerText = rpm;
+                let rpmDeg = -90 + (Math.min(rpm, 100) / 100) * 180;
+                needleRpm.style.transform = `translateX(-50%) rotate(${rpmDeg}deg)`;
+            }
+            
+            // RLPD METER (Dynamic Max)
+            const needleRlpd = document.getElementById('needle-rlpd');
+            const valRlpd = document.getElementById('val-rlpd');
+            if(needleRlpd && valRlpd) {
+                valRlpd.innerText = total_queries;
+                let maxRlpd = Math.max(1500, total_queries + 500); 
+                let rlpdDeg = -90 + (total_queries / maxRlpd) * 180;
+                needleRlpd.style.transform = `translateX(-50%) rotate(${rlpdDeg}deg)`;
+            }
+        }
 
         async function fetchStats() {
             try {
@@ -1140,6 +1257,9 @@ HTML_TEMPLATE = """
                 document.getElementById('queries').innerText = data.total_queries;
                 document.getElementById('memory').innerText = data.active_memory_rows;
                 document.getElementById('db-size').innerText = data.db_size;
+                
+                // Animate Cockpit Gauges
+                updateGauges(data.rpm, data.total_queries);
                 
                 if (lastQueryCount !== 0 && data.total_queries > lastQueryCount) {
                     const time = new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -1451,6 +1571,7 @@ async def logout():
 
 @app.route('/api/stats')
 async def api_stats():
+    global QUERY_TIMESTAMPS
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
     
     uptime_seconds = int(time.time() - START_TIME)
@@ -1459,13 +1580,17 @@ async def api_stats():
     try: db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
     except: db_size_kb = 0
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM message_history") as cursor:
-            rows = (await cursor.fetchone())[0]
+    async with DB_CONN.execute("SELECT COUNT(*) FROM message_history") as cursor:
+        rows = (await cursor.fetchone())[0]
             
     current_model = get_config('current_model', 'gemini-2.5-flash-lite')
+    
+    # Calculate live RPM
+    now = time.time()
+    QUERY_TIMESTAMPS[:] = [ts for ts in QUERY_TIMESTAMPS if now - ts < 60.0]
+    current_rpm = len(QUERY_TIMESTAMPS)
         
-    return jsonify({"uptime": uptime_str, "total_queries": TOTAL_QUERIES, "active_memory_rows": rows, "db_size": db_size_kb, "current_model": current_model})
+    return jsonify({"uptime": uptime_str, "total_queries": TOTAL_QUERIES, "active_memory_rows": rows, "db_size": db_size_kb, "current_model": current_model, "rpm": current_rpm})
 
 @app.route('/api/sys_info')
 async def api_sys_info():
@@ -1488,9 +1613,12 @@ async def api_sys_gc():
 @app.route('/api/sys_vacuum', methods=['POST'])
 async def api_sys_vacuum():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    async with aiosqlite.connect(DB_PATH, isolation_level=None) as db:
-        await db.execute("VACUUM")
-    return jsonify(success=True)
+    try:
+        async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
+            await db_vac.execute("VACUUM")
+        return jsonify(success=True)
+    except Exception as e:
+        return jsonify(success=False, error=str(e)), 500
 
 @app.route('/api/diagnostics', methods=['POST'])
 async def api_diagnostics():
@@ -1523,9 +1651,8 @@ async def api_config():
 @app.route('/api/errors')
 async def api_errors():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT timestamp, user, trace FROM system_errors ORDER BY timestamp DESC") as cursor:
-            rows = await cursor.fetchall()
+    async with DB_CONN.execute("SELECT timestamp, user, trace FROM system_errors ORDER BY timestamp DESC") as cursor:
+        rows = await cursor.fetchall()
     
     errors = [{"time": datetime.datetime.fromtimestamp(r[0]).strftime('%Y-%m-%d %H:%M:%S'), "user": r[1], "trace": r[2]} for r in rows]
     return jsonify(errors=errors)
@@ -1533,17 +1660,15 @@ async def api_errors():
 @app.route('/api/clear_errors', methods=['POST'])
 async def api_clear_errors():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM system_errors")
-        await db.commit()
+    await DB_CONN.execute("DELETE FROM system_errors")
+    await DB_CONN.commit()
     return jsonify(success=True)
 
 @app.route('/api/nuke', methods=['POST'])
 async def api_nuke():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM message_history")
-        await db.commit()
+    await DB_CONN.execute("DELETE FROM message_history")
+    await DB_CONN.commit()
     return jsonify(success=True)
 
 if __name__ == "__main__":
