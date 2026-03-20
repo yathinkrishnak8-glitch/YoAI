@@ -27,9 +27,6 @@ QUERY_TIMESTAMPS = []
 DB_PATH = "yoai.db"
 DB_CONN = None
 
-# 🔴 ANTI-SPAM SHIELD: Prevents Discord Cloudflare Bans
-LAST_ALERT_TIME = 0.0
-
 CONFIG_CACHE = {}
 CHANNEL_BUFFERS = {}
 CHANNEL_TIMERS = {}
@@ -341,7 +338,8 @@ class YoAIBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        print(f"[SYS] Matrix Sync bypassed on boot to prevent Cloudflare 1015 Bans. Use !sync to register commands.")
+        await self.tree.sync()
+        print(f"Synced commands for {self.user}")
         await init_db()
         bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT))
 
@@ -382,12 +380,6 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     if not status_loop.is_running(): status_loop.start()
     if not optimize_db.is_running(): optimize_db.start()
-
-@bot.command(name="sync")
-async def sync_cmds(ctx):
-    if ctx.author.id != 1285791141266063475: return
-    await bot.tree.sync()
-    await ctx.send("✅ Slash commands manually synchronized to Discord API.")
 
 # -------------------- The AI Generator --------------------
 async def generate_ai_response(channel: discord.abc.Messageable, user_message: str, author: discord.User, image_parts: list = None) -> str:
@@ -459,7 +451,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 4.4", color=0xff2a2a, description="Advanced Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine", color=0xff2a2a, description="Advanced Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -598,13 +590,11 @@ async def unsetchannel(interaction: discord.Interaction):
     await toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}")
 
-# -------------------- Clean On-Message Routing (No Double Execution) --------------------
+# -------------------- Direct On-Message Routing (2.0s Debouncer Restored) --------------------
 
 async def process_channel_buffer(channel_id):
-    global LAST_ALERT_TIME
-    
-    # 🔴 0.5s HYPER-DEBOUNCER
-    await asyncio.sleep(0.5) 
+    # 🔴 THE SHIELD: 2.0s delay restored to naturally prevent Discord API spam and Cloudflare bans
+    await asyncio.sleep(2.0) 
     if channel_id not in CHANNEL_BUFFERS: return
     
     data = CHANNEL_BUFFERS.pop(channel_id)
@@ -632,30 +622,28 @@ async def process_channel_buffer(channel_id):
                 
     except Exception as e:
         error_msg_str = str(e)
+        
+        # 🔴 RESTORED: Standard error reporting. 
+        try:
+            error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
+            await msg_obj.reply(error_public, mention_author=False)
+        except discord.Forbidden:
+            pass 
+        
         await log_system_error(str(author), error_msg_str)
         
-        # 🔴 THE "SAFE" PUBLIC ERROR: Protected by the 15-second anti-ban shield.
-        now = time.time()
-        if now - LAST_ALERT_TIME > 15.0:
-            LAST_ALERT_TIME = now
-            try:
-                error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
-                await msg_obj.reply(error_public, mention_author=False)
-            except discord.Forbidden:
-                pass 
-            
-            try:
-                app_info = await bot.application_info()
-                admin_user = app_info.owner
-                error_dm = (
-                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
-                    f"**Triggered By:** {author} (`{author.id}`)\n"
-                    f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
-                    f"**Error Trace:**\n```\n{error_msg_str}\n```"
-                )
-                await admin_user.send(error_dm)
-            except Exception as dm_error:
-                print(f"Failed to DM admin: {dm_error}")
+        try:
+            app_info = await bot.application_info()
+            admin_user = app_info.owner
+            error_dm = (
+                f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
+                f"**Triggered By:** {author} (`{author.id}`)\n"
+                f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
+                f"**Error Trace:**\n```\n{error_msg_str}\n```"
+            )
+            await admin_user.send(error_dm)
+        except Exception as dm_error:
+            print(f"Failed to DM admin: {dm_error}")
             
     finally:
         if 'data' in locals(): del data
@@ -683,7 +671,6 @@ async def on_message(message: discord.Message):
 
         channel_id = message.channel.id
         
-        # 🔴 ONLY ADD TO BUFFER (Removed the bug that caused double API calls)
         if channel_id not in CHANNEL_BUFFERS:
             CHANNEL_BUFFERS[channel_id] = {
                 'content': [],
@@ -1174,7 +1161,7 @@ HTML_TEMPLATE = """
                 <div class="card glass">
                     <h2 style="font-size: 1.2rem; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px; margin-bottom: 20px;">Complete Feature List</h2>
                     <ul class="feature-list">
-                        <li style="--anim-delay: 0.1s">⚡ <strong>Zero-Delay Direct Async Event Routing:</strong> Instantaneous 0.5s debouncer to catch messages perfectly without double-executing API calls.</li>
+                        <li style="--anim-delay: 0.1s">⚡ <strong>Stable 2.0s Debouncer Buffer:</strong> Restored the rock-solid message buffer to group chats and natively prevent Discord Cloudflare API bans.</li>
                         <li style="--anim-delay: 0.2s">⚖️ <strong>Round-Robin API Load Balancer:</strong> Flawlessly rotates Gemini keys to multiply RPM limits.</li>
                         <li style="--anim-delay: 0.3s">⏱️ <strong>Internal Stopwatch Tracking:</strong> Pre-emptively benches keys before Google triggers a Rate Limit.</li>
                         <li style="--anim-delay: 0.4s">🏎️ <strong>Supercar UI Gauges:</strong> Live CSS Tachometers visualizing RPM and RLPD in the Cockpit.</li>
@@ -1187,7 +1174,7 @@ HTML_TEMPLATE = """
                         <li style="--anim-delay: 1.1s">📸 <strong>Multi-Modal Vision Guard:</strong> Automatically rejects huge images (>4MB) from crashing the server.</li>
                         <li style="--anim-delay: 1.2s">🚨 <strong>Anti-Freeze API Shield:</strong> Forces a hard 30-second timeout on Google requests to prevent indefinite bot hangs.</li>
                         <li style="--anim-delay: 1.3s">🌐 <strong>Universal Add Command (/invite):</strong> Secure OAuth2 generation that automatically expels the bot if triggered inside an existing guild.</li>
-                        <li style="--anim-delay: 1.4s">🛡️ <strong>Anti-Spam Discord Guard:</strong> Forces a 15-second cooldown on public crash alerts and Admin DMs to guarantee zero Cloudflare IP bans.</li>
+                        <li style="--anim-delay: 1.4s">🛡️ <strong>Restored Full Error Diagnostics:</strong> The bot accurately reports crashes to the channel and DMs without artificially restricting data flow.</li>
                     </ul>
                 </div>
             </div>
@@ -1423,7 +1410,7 @@ HTML_TEMPLATE = """
                     document.getElementById('safety-hate').value = data.safety_hate;
                     document.getElementById('safety-harass').value = data.safety_harassment;
                     document.getElementById('safety-explicit').value = data.safety_explicit;
-                    document.getElementById('safety-danger').value = data.safety_dangerous;
+                    document.getElementById('safety-danger').value = data.safety_danger;
                     
                     configLoaded = true; 
                 }
