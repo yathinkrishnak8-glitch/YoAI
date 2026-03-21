@@ -1547,4 +1547,30 @@ async def api_nuke():
     return jsonify(success=True)
 
 if __name__ == "__main__":
-    bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    if not token:
+        print("[SYS] CRITICAL: DISCORD_BOT_TOKEN environment variable not set.")
+        exit(1)
+
+    print("[SYS] Initiating Boot Sequence with Anti-Cloudflare Auto-Retry...")
+    
+    while True:
+        try:
+            bot.run(token)
+            # If bot.run() exits normally without throwing an exception, we break the loop
+            break
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                print(f"⚠️ [CLOUDFLARE/IP BAN] HTTP 429 Too Many Requests detected.")
+            else:
+                print(f"⚠️ [DISCORD HTTP ERROR] Status {e.status}: {e}")
+            
+            print("⏳ Holding connection... Retrying in 60 seconds to let the IP ban lift.")
+            time.sleep(60)
+        except discord.errors.LoginFailure as e:
+            print(f"🛑 [LOGIN FAILURE] Invalid Token: {e}. Stopping boot sequence.")
+            break 
+        except Exception as e:
+            print(f"⚠️ [CRASH] Unexpected error during connection: {e}")
+            print("⏳ Retrying connection in 60 seconds...")
+            time.sleep(60)
