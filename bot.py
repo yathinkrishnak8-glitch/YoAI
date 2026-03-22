@@ -1567,6 +1567,10 @@ if __name__ == "__main__":
                     await bot.start(token)
                     break  # If bot connects, exit the loop
                 except discord.errors.HTTPException as e:
+                    # 🔴 CRITICAL NEW FIX: Close the leaked aiohttp session to prevent connection pileup!
+                    if not bot.is_closed():
+                        await bot.close()
+
                     if getattr(e, 'status', 0) == 429:
                         print(f"⚠️ [CLOUDFLARE/IP BAN] HTTP 429 Too Many Requests detected.")
                     else:
@@ -1583,9 +1587,13 @@ if __name__ == "__main__":
                     
                 except discord.errors.LoginFailure as e:
                     print(f"🛑 [LOGIN FAILURE] Invalid Token: {e}. Stopping boot sequence.")
+                    if not bot.is_closed():
+                        await bot.close()
                     break
                 except Exception as e:
                     print(f"⚠️ [CRASH] Unexpected error during connection: {e}")
+                    if not bot.is_closed():
+                        await bot.close()
                     print("⏳ Retrying connection in 60 seconds...")
                     await asyncio.sleep(60)
 
