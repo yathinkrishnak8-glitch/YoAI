@@ -455,8 +455,8 @@ class EngineInfoView(discord.ui.View):
         
         team = [
             {"name": "mr_yaen", "role": "👑 Master Developer", "color": 0xff2a2a},
-            {"name": "flores.mortui", "role": "🛠️ Senior Tester", "color": 0xf59e0b},
-            {"name": "darkest_race", "role": "🐛 Junior Tester", "color": 0x10b981}
+            {"name": "flores.mortui", "role": "✨ Senior Tester", "color": 0xf59e0b},
+            {"name": "darkest_race", "role": "⚔️ Junior Tester", "color": 0x10b981}
         ]
 
         for t in team:
@@ -503,7 +503,8 @@ class EngineInfoView(discord.ui.View):
             
         embeds[-1].set_footer(text="YoAI Development Protocol")
         
-        await interaction.response.send_message(embeds=embeds, ephemeral=True)
+        # Ephemeral set to False so everyone in the channel can see the panel
+        await interaction.response.send_message(embeds=embeds, ephemeral=False)
 
 # -------------------- Slash Commands --------------------
 
